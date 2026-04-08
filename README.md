@@ -6,4 +6,4 @@ vulkan wallhack hook dll
 you need to inject early to intercept functions!
 3. use keys . and , to cycle through strides
 
-![alt tag](https://github.com/DrNseven/VulkanWallhack/blob/main/vkwallhack.jpg)
+![alt tag](https://github.com/DrNseven/VulkanWallhack/blob/main/vwallhack.jpg)
