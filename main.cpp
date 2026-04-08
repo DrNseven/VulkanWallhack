@@ -315,7 +315,8 @@ void VKAPI_CALL DetourVkCmdDrawIndexed(VkCommandBuffer cmd, uint32_t idxCount, u
     }
 
     // Logic: If stride matches our selection, disable depth test to see through walls
-    if (gp_vkCmdSetDepthTestEnable && currentStride == (uint32_t)countnum) {
+    if (gp_vkCmdSetDepthTestEnable)
+        if(currentStride == (uint32_t)countnum|| idxCount/100==countnum || idxCount / 1000 == countnum) {
         gp_vkCmdSetDepthTestEnable(cmd, VK_FALSE); // Disable depth (Wallhack)
         pOriginalCmdDrawIndexed(cmd, idxCount, instCount, firstIdx, vtxOff, firstInst);
         gp_vkCmdSetDepthTestEnable(cmd, VK_TRUE);  // Restore depth for next object
@@ -329,7 +330,8 @@ void VKAPI_CALL DetourVkCmdDrawIndexed(VkCommandBuffer cmd, uint32_t idxCount, u
         //return;
     //}
     
-    if (found && currentStride == (uint32_t)countnum) {
+    if (found)
+        if(currentStride == (uint32_t)countnum || idxCount / 100 == countnum || idxCount / 1000 == countnum) {
         // --- APPLY HACK ---
         const VkViewport originalVp = localState.currentViewport;
         VkViewport hVp = originalVp;
