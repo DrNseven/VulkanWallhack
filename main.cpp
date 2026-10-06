@@ -676,83 +676,45 @@ void VKAPI_CALL DetourVkCmdDrawIndexed(VkCommandBuffer cmd, uint32_t idxCount, u
         loggedOnce = true;
     }
 
-    //key
-    uint64_t key = 0;
+
+    uint64_t   key = 0;
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    VkPipeline highPipe = VK_NULL_HANDLE;
+    uint32_t   dstride = 0;   // dynamic (per command buffer)
+    uint32_t   pstride = 0;   // static (per pipeline)
     {
-        std::lock_guard<std::mutex> lock(g_mtx);
-        auto it = g_curKey.find(cmd);
-        if (it != g_curKey.end())
-            key = it->second;
-    }
-    uint32_t shortKey = static_cast<uint32_t>(key % 100); 
+        std::lock_guard<std::mutex> lock(g_mtx);   // the ONLY lock in this function
 
+        auto kit = g_curKey.find(cmd);
+        if (kit != g_curKey.end())
+            key = kit->second;
 
-    //stride (not dynamic)
-    uint32_t stride = 0;
-    {
-        std::lock_guard<std::mutex> lock(g_mtx);
-
-        auto curPipeIt = g_curPipeline.find(cmd);
-        if (curPipeIt != g_curPipeline.end() && curPipeIt->second != VK_NULL_HANDLE)
+        auto pit = g_curPipeline.find(cmd);
+        if (pit != g_curPipeline.end())
         {
-            auto pipeStrideIt = g_pipelineStrides.find(curPipeIt->second);
-            if (pipeStrideIt != g_pipelineStrides.end())
-                stride = pipeStrideIt->second;
-        }
-    }
-    
-    //if(stride > 0)
-    //Log("stride == %d", stride);
-    
-    //uint32_t stride = 0;
-    //{
-        // 2) Fallback: Fetch from dynamic command buffer state if pipeline lookup was empty
-        //std::lock_guard<std::mutex> lock(g_mtx);
-        //auto it = g_cmdBufStride.find(cmd);
-        //if (it != g_cmdBufStride.end())
-            //stride = it->second;
-    //}
+            pipeline = pit->second;
 
-    /*
-    // Look up the vertex-input state that was previously recorded
-    // for this command buffer via DetourVkCmdSetVertexInputEXT
-    auto it = g_cmdBufVertexInput.find(cmd);
-    if (it != g_cmdBufVertexInput.end())
-    {
-        const VertexInputState& state = it->second;
-
-        // ------------------------------------------------------------------
-        // Example usage – pick whatever you need for model recognition
-        // ------------------------------------------------------------------
-
-        // 1. Stride of binding 0 (most common case)
-        uint32_t stride0 = 0;
-        if (state.bindingCount > 0)
-            stride0 = state.bindings[0].stride;
-
-        // 2. All binding strides
-        for (uint32_t i = 0; i < state.bindingCount; ++i)
-        {
-            uint32_t stride = state.bindings[i].stride;
-            uint32_t binding = state.bindings[i].binding;
-            // … use them …
+            auto hit = g_highlightPipelines.find(pipeline);
+            if (hit != g_highlightPipelines.end())
+                highPipe = hit->second;
         }
 
-        // 3. Attribute descriptions (location / format / offset)
-        for (uint32_t i = 0; i < state.attributeCount; ++i)
+        auto sit = g_cmdBufStride.find(cmd);
+        if (sit != g_cmdBufStride.end())
+            dstride = sit->second;
+
+        // only touch g_pipelineStrides when there is no dynamic stride
+        if (dstride == 0 && pipeline != VK_NULL_HANDLE)
         {
-            const auto& attr = state.attributes[i];
-            // attr.location, attr.binding, attr.format, attr.offset
-            // These are usually the best fingerprint for a mesh
+            auto pst = g_pipelineStrides.find(pipeline);
+            if (pst != g_pipelineStrides.end())
+                pstride = pst->second;
         }
-
-        // 4. Simple hash of the whole state (good for recognition)
-        //    (you would implement your own hash function)
-        // size_t hash = HashVertexInputState(state);
-        // if (hash == knownPlayerHash) { … }
-    }
-    */
-
+    }   // released; nothing below touches g_mtx
+    const uint32_t shortKey = static_cast<uint32_t>(key % 100);
+    const uint32_t stride = dstride ? dstride : pstride;
+  
+  
 
     //viewport
     CmdState localState;
@@ -768,7 +730,7 @@ void VKAPI_CALL DetourVkCmdDrawIndexed(VkCommandBuffer cmd, uint32_t idxCount, u
 
 
     //if (shortKey == countnum)
-    if(stride == countnum) //40 = valheim
+    if(stride > 0 && stride == countnum) //40 = valheim
     {
         //return;
         
@@ -792,6 +754,93 @@ void VKAPI_CALL DetourVkCmdDrawIndexed(VkCommandBuffer cmd, uint32_t idxCount, u
         
     }
 
+
+
+
+
+    /*
+    std::lock_guard<std::mutex> lock(g_mtx);
+
+    auto pipeIt = g_curPipeline.find(cmd);
+
+    //Log("1");
+
+    if (pipeIt == g_curPipeline.end())
+    {
+        //Log("NO PIPELINE");
+        pOriginalCmdDrawIndexed(
+            cmd, idxCount, instCount,
+            firstIdx, vtxOff, firstInst);
+        return;
+    }
+
+    //Log("PIPELINE FOUND");
+
+    VkPipeline currentPipe = pipeIt->second;
+
+    //Log("stride=%zu", stride);
+
+    if (stride <= 0 || stride != 40)
+    {
+        //Log("STRIDE FAILED");
+        pOriginalCmdDrawIndexed(
+            cmd, idxCount, instCount,
+            firstIdx, vtxOff, firstInst);
+        return;
+    }
+
+    //Log("STRIDE OK");
+
+    auto hlIt = g_highlightPipelines.find(currentPipe);
+
+    if (hlIt == g_highlightPipelines.end())
+    {
+        //Log("NO HIGHLIGHT PIPELINE");
+        pOriginalCmdDrawIndexed(
+            cmd, idxCount, instCount,
+            firstIdx, vtxOff, firstInst);
+        return;
+    }
+
+    Log("HIGHLIGHT PIPELINE FOUND");
+
+    VkPipeline highlightPipe = hlIt->second;
+
+    pOriginalCmdBindPipeline(
+        cmd,
+        VK_PIPELINE_BIND_POINT_GRAPHICS,
+        highlightPipe
+    );
+
+    Log("HIGHLIGHT PIPELINE BOUND");
+
+    const float redColor[4] = {
+        1.0f, 0.0f, 0.0f, 1.0f
+    };
+
+    vkCmdSetBlendConstants(cmd, redColor);
+
+    Log("BLEND CONSTANT SET");
+
+    pOriginalCmdDrawIndexed(
+        cmd,
+        idxCount,
+        instCount,
+        firstIdx,
+        vtxOff,
+        firstInst
+    );
+
+    Log("HIGHLIGHT DRAW");
+
+    pOriginalCmdBindPipeline(
+        cmd,
+        VK_PIPELINE_BIND_POINT_GRAPHICS,
+        currentPipe
+    );
+
+    */
+
     /*
     //pipeline
     std::lock_guard<std::mutex> lock(g_mtx);
@@ -799,6 +848,7 @@ void VKAPI_CALL DetourVkCmdDrawIndexed(VkCommandBuffer cmd, uint32_t idxCount, u
     auto pipeIt = g_curPipeline.find(cmd);
     if (pipeIt == g_curPipeline.end())
     {
+        Log("no pipeline known");
         // no pipeline known → just draw normally
         pOriginalCmdDrawIndexed(cmd, idxCount, instCount, firstIdx, vtxOff, firstInst);
         return;
@@ -809,156 +859,48 @@ void VKAPI_CALL DetourVkCmdDrawIndexed(VkCommandBuffer cmd, uint32_t idxCount, u
     //Log("stride == %d", stride);
     // Find the currently bound pipeline for this command buffer
     auto curIt = g_curPipeline.find(cmd);
-    if(key == 49)
-    if (curIt != g_curPipeline.end())
     {
-        VkPipeline currentPipe = curIt->second;
-
-        // Check if a highlight version exists for the bound pipeline
-        auto hlIt = g_highlightPipelines.find(currentPipe);
-        if (hlIt != g_highlightPipelines.end())
+        Log("1");
+        if (curIt != g_curPipeline.end() && stride > 0 && stride == 48)
         {
-            VkPipeline highlightPipe = hlIt->second;
+            Log("2");
+            VkPipeline currentPipe = curIt->second;
 
-            // 1) Bind the solid-color highlight pipeline
-            pOriginalCmdBindPipeline(
-                cmd,
-                VK_PIPELINE_BIND_POINT_GRAPHICS,
-                highlightPipe
-            );
+            // Check if a highlight version exists for the bound pipeline
+            auto hlIt = g_highlightPipelines.find(currentPipe);
+            if (hlIt != g_highlightPipelines.end())
+            {
+                Log("3");
+                VkPipeline highlightPipe = hlIt->second;
 
-            // 2) Set your custom RGBA color (e.g., Red: 1.0, 0.0, 0.0, 1.0)
-            const float redColor[4] = { 255.0f, 0.0f, 0.0f, 1.0f };
-            vkCmdSetBlendConstants(cmd, redColor);
+                // 1) Bind the solid-color highlight pipeline
+                pOriginalCmdBindPipeline(
+                    cmd,
+                    VK_PIPELINE_BIND_POINT_GRAPHICS,
+                    highlightPipe
+                );
 
-            // 3) Draw with the highlight pipeline
-            pOriginalCmdDrawIndexed(cmd, idxCount, instCount, firstIdx, vtxOff, firstInst);
+                // 2) Set your custom RGBA color (e.g., Red: 1.0, 0.0, 0.0, 1.0)
+                const float redColor[4] = { 255.0f, 0.0f, 0.0f, 1.0f };
+                vkCmdSetBlendConstants(cmd, redColor);
 
-            // 4) Restore original pipeline state back to the command buffer
-            pOriginalCmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,currentPipe);
+                // 3) Draw with the highlight pipeline
+                pOriginalCmdDrawIndexed(cmd, idxCount, instCount, firstIdx, vtxOff, firstInst);
 
-            return;
-        }
-        //else
-        //{
-            // Reset blend constants back to default white for normal rendering
-            //const float defaultColor[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
-            //vkCmdSetBlendConstants(cmd, defaultColor);
-        //}
-    }
-    */
-    //VkPipeline originalPipeline = pipeIt->second;          // ← this is “the original pipeline handle”
-    /*
-    VkPipeline originalPipeline = VK_NULL_HANDLE;
-    VkPipeline highPipe = VK_NULL_HANDLE;
-    {
-        std::lock_guard<std::mutex> lock(g_mtx);
+                // 4) Restore original pipeline state back to the command buffer
+                pOriginalCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, currentPipe);
 
-        auto pit = g_curPipeline.find(cmd);
-        if (pit != g_curPipeline.end())
-        {
-            originalPipeline = pit->second;
-            auto hit = g_highlightPipelines.find(originalPipeline);
-            if (hit != g_highlightPipelines.end())
-                highPipe = hit->second;
-        }
-    }   // g_mtx released here; nothing below touches it
-
-    const bool swap = (stride == 40) && highPipe != VK_NULL_HANDLE;
-
-    if (swap)
-        pOriginalCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, highPipe);
-
-    pOriginalCmdDrawIndexed(cmd, idxCount, instCount, firstIdx, vtxOff, firstInst);
-
-    if (swap)
-        pOriginalCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, originalPipeline);
-    */
-
-    /*
-    auto highIt = g_highlightPipelines.find(originalPipeline);
-    //if(shortKey == countnum)
-    //if(stride == 40)
-    if (shortKey == countnum && highIt != g_highlightPipelines.end())
-    {
-        // temporarily bind the highlight version
-        pOriginalCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, highIt->second);
-
-        const float blendConstants[4] = { 1.0f, 0.0f, 0.0f, 1.0f }; // red
-        vkCmdSetBlendConstants(cmd, blendConstants);
-    }
-    //else
-    //{
-      //  float defaultColor[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
-        //vkCmdSetBlendConstants(cmd, defaultColor);
-    //}
-    */
-
-    /*
-    auto it = pipelineData.find(currentPipe);
-    if (it != pipelineData.end())
-    {
-        PipelineSettings& s = it->second;
-
-        uint32_t currentPipeID = GetPipeShortID(currentPipe);
-
-        if (s.stride == countnum)// && currentBoundSets == 2 && shortvoffset == countnum)
-            //if (s.stride == 12 && s.attrCount == 6 && shortPushID == 1148||//push.firstU32 == countnum)//g_TargetPipeID) //13
-                //s.stride == 12 && s.attrCount == 6 && shortPushID == 2296)
-            //if (s.stride == 12 && s.attrCount == 6 && shortPushID == 1148||
-                //s.stride == 12 && s.attrCount == 6 && shortPushID == 0)
-                // or the stricter version:
-                // if (currentPipeID == g_TargetPipeID && s.stride == 12 && s.attrCount == 6 ...)
-        {
-            Log("s.stride == %d && s.attrCount == %d && s.stride1 == %d && s.stride2 == %d && s.format0 == %d && s.depthTestEnable == %d && s.offsetSum == %d && s.depthCompareOp == %d && s.dnaHash == %d",
-                s.stride, s.attrCount, s.stride1, s.stride2, s.format0, s.depthTestEnable, s.offsetSum, s.depthCompareOp, s.dnaHash);
-            //s.stride == 48 && s.stride1 == 4 && s.stride2 == 0 && s.stride3 == 0 && s.stride4 == 0 && s.format0 == 91 && s.depthTestEnable == 1 && s.offsetSum == 232 && 
-            //s.depthCompareOp == 3 && s.dnaHash == 50876163
-            //Log("s.attrCount == %d && idxCount=%u && shortvoffset == %d && boundVBuffer == %d && bruteforceSetCount == %d && currentLayout == %d && currentBoundSets == %d", 
-                //s.attrCount, idxCount, shortvoffset, boundVBuffer, bruteforceSetCount, currentLayout, currentBoundSets);
-            //Log("g_TargetPipe == %p && g_TargetPipeID == %d && countnum == %d", g_TargetPipe, g_TargetPipeID, countnum);
-            float myCustomColor[4] = { 25.0f, 255.0f, 0.0f, 1.0f };
-            vkCmdSetBlendConstants(cmd, myCustomColor);
-        }
-        else
-        {
-            float defaultColor[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
-            vkCmdSetBlendConstants(cmd, defaultColor);
+                return;
+            }
+            //else
+            //{
+                // Reset blend constants back to default white for normal rendering
+                //const float defaultColor[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
+                //vkCmdSetBlendConstants(cmd, defaultColor);
+            //}
         }
     }
     */
-
-        /*
-        //dynamic coloring example (does not work in valheim, only works in very few games like deadlock)
-        VkBool32 enable = VK_TRUE;
-
-        //vkCmdSetColorBlendEnableEXT(cmd, 0, 1, &enable);
-        pfnCmdSetColorBlendEnableEXT(cmd, 0, 1, &enable);
-
-        VkColorBlendEquationEXT eq{};
-        eq.srcColorBlendFactor = VK_BLEND_FACTOR_CONSTANT_COLOR;
-        eq.dstColorBlendFactor = VK_BLEND_FACTOR_ZERO;
-        eq.colorBlendOp = VK_BLEND_OP_ADD;
-
-        eq.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
-        eq.dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
-        eq.alphaBlendOp = VK_BLEND_OP_ADD;
-
-        //vkCmdSetColorBlendEquationEXT(cmd, 0, 1, &eq);
-        pfnCmdSetColorBlendEquationEXT(cmd, 0, 1, &eq);
-
-        const float blendConstants[4] = {
-            1.0f, 0.0f, 0.0f, 1.0f
-        };
-
-        vkCmdSetBlendConstants(cmd, blendConstants);
-        */
-    
-    //else
-    //{
-        //float defaultColor[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
-        //vkCmdSetBlendConstants(cmd, defaultColor);
-    //}
 
     pOriginalCmdDrawIndexed(cmd, idxCount, instCount, firstIdx, vtxOff, firstInst);
 }
@@ -1061,6 +1003,41 @@ static bool HookViaDummyDevice()
     VkInstanceCreateInfo ici{ VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO };
     ici.pApplicationInfo = &app;
 
+
+
+    Sleep(250);   // let the loader finish its first-time init
+
+    VkInstance inst = VK_NULL_HANDLE;
+    VkResult r = VK_ERROR_INITIALIZATION_FAILED;
+
+    for (int attempt = 0; attempt < 50; ++attempt)   // up to ~10 s
+    {
+        r = fnCreateInstance(&ici, nullptr, &inst);
+        if (r == VK_SUCCESS && inst)
+            break;
+
+        Log("dummy: vkCreateInstance attempt %d failed (%d)", attempt, (int)r);
+        inst = VK_NULL_HANDLE;
+        Sleep(200);
+    }
+
+    if (!inst)
+    {
+        Log("dummy: giving up");
+
+        char path[MAX_PATH]{};
+        GetModuleFileNameA(hVk, path, MAX_PATH);
+        Log("dummy: vulkan-1.dll = %s", path);
+
+        auto fnVer = (PFN_vkEnumerateInstanceVersion)GetProcAddress(hVk, "vkEnumerateInstanceVersion");
+        uint32_t ver = 0;
+        if (fnVer && fnVer(&ver) == VK_SUCCESS)
+            Log("dummy: loader instance version %u.%u", VK_VERSION_MAJOR(ver), VK_VERSION_MINOR(ver));
+
+        return false;
+    }
+
+    /*
     VkInstance inst = VK_NULL_HANDLE;
     VkResult r = fnCreateInstance(&ici, nullptr, &inst);
     if (r != VK_SUCCESS || !inst)
@@ -1068,6 +1045,7 @@ static bool HookViaDummyDevice()
         Log("dummy: vkCreateInstance failed (%d)", (int)r);
         return false;
     }
+    */
 
     auto fnEnumPhys = (PFN_vkEnumeratePhysicalDevices)
         fnGetInstanceProcAddr(inst, "vkEnumeratePhysicalDevices");
