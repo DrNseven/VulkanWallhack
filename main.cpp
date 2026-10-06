@@ -203,12 +203,12 @@ std::unordered_map<VkPipeline, uint32_t> g_pipelineStrides; // pipeline -> bindi
 std::unordered_map<VkCommandBuffer, std::unordered_map<uint32_t, uint32_t>> g_cmdBufStrides;
 
 
-// Needs: <vector> <atomic> <mutex>
-// Assumes your existing globals: g_mtx (std::mutex), g_moduleHash, g_pipelineKey,
-// g_pipelineStrides (VkPipeline -> uint32_t), g_highlightPipelines (VkPipeline -> VkPipeline),
-// combine(), Log(), kVerboseKeyLog, pOriginalCreateGraphicsPipelines.
 
 static constexpr uint32_t kHighlightStride = 40;   // models
+
+// Set to true ONLY if the game's device enabled VK_EXT_extended_dynamic_state
+// (or Vulkan 1.3). Needed for the optional depth states (wallhack).
+static bool gGameEnabledExtDynState = false;
 
 // Short lock, lookup only, no calls made while it is held
 static bool GetModuleHash(VkShaderModule m, uint64_t& out)
@@ -221,6 +221,368 @@ static bool GetModuleHash(VkShaderModule m, uint64_t& out)
     return true;
 }
 
+
+VKAPI_ATTR VkResult VKAPI_CALL DetourVkCreateGraphicsPipelines(
+    VkDevice device,
+    VkPipelineCache cache,
+    uint32_t count,
+    const VkGraphicsPipelineCreateInfo* pCreateInfos,
+    const VkAllocationCallbacks* pAllocator,
+    VkPipeline* pPipelines)
+{
+    static std::atomic<bool> s_loggedOnce{ false };
+    if (!s_loggedOnce.exchange(true))
+        Log("DetourVkCreateGraphicsPipelines");
+
+    // 1) Create the original pipelines first
+    VkResult r = pOriginalCreateGraphicsPipelines(device, cache, count, pCreateInfos, pAllocator, pPipelines);
+
+    // Don't bail on r != VK_SUCCESS: partial results (e.g. VK_PIPELINE_COMPILE_REQUIRED)
+    // still leave valid handles in pPipelines. Each handle is checked below.
+    if (!pCreateInfos || !pPipelines || count == 0)
+        return r;
+
+    struct Entry
+    {
+        VkPipeline pipe = VK_NULL_HANDLE;
+        uint32_t   stride = 0;
+        uint64_t   key = 0;
+        VkPipeline highlight = VK_NULL_HANDLE;
+    };
+
+    std::vector<Entry> entries;
+    entries.reserve(count);
+
+    // NO lock is held while we compute, hash, or create clones.
+    for (uint32_t i = 0; i < count; ++i)
+    {
+        if (pPipelines[i] == VK_NULL_HANDLE)
+            continue;
+
+        const VkGraphicsPipelineCreateInfo& ci = pCreateInfos[i];
+
+        Entry e;
+        e.pipe = pPipelines[i];
+
+        // ------------------------------------------------------------
+        // Dynamic-state flags
+        // ------------------------------------------------------------
+        bool strideDyn = false;
+        bool vinDyn = false;
+
+        if (ci.pDynamicState && ci.pDynamicState->pDynamicStates)
+        {
+            for (uint32_t d = 0; d < ci.pDynamicState->dynamicStateCount; ++d)
+            {
+                const VkDynamicState s = ci.pDynamicState->pDynamicStates[d];
+                if (s == VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE) strideDyn = true;
+                if (s == VK_DYNAMIC_STATE_VERTEX_INPUT_EXT)            vinDyn = true;
+            }
+        }
+
+        // ------------------------------------------------------------
+        // Pipeline-library awareness (state in a library is ignored
+        // unless that library owns it)
+        // ------------------------------------------------------------
+        bool hasGplInfo = false;
+        VkGraphicsPipelineLibraryFlagsEXT gplFlags = 0;
+        bool isLinked = false;
+
+        for (auto p = static_cast<const VkBaseInStructure*>(ci.pNext); p; p = p->pNext)
+        {
+            if (p->sType == VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_LIBRARY_CREATE_INFO_EXT)
+            {
+                hasGplInfo = true;
+                gplFlags = reinterpret_cast<const VkGraphicsPipelineLibraryCreateInfoEXT*>(p)->flags;
+            }
+            else if (p->sType == VK_STRUCTURE_TYPE_PIPELINE_LIBRARY_CREATE_INFO_KHR)
+            {
+                if (reinterpret_cast<const VkPipelineLibraryCreateInfoKHR*>(p)->libraryCount > 0)
+                    isLinked = true;
+            }
+        }
+
+        const bool ownsVertexInput =
+            !hasGplInfo || (gplFlags & VK_GRAPHICS_PIPELINE_LIBRARY_VERTEX_INPUT_INTERFACE_BIT_EXT);
+        const bool ownsFragmentOutput =
+            !hasGplInfo || (gplFlags & VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_OUTPUT_INTERFACE_BIT_EXT);
+
+        // pVertexInputState is only meaningful in these cases; otherwise it may be null/junk
+        const VkPipelineVertexInputStateCreateInfo* vis =
+            (!vinDyn && ownsVertexInput) ? ci.pVertexInputState : nullptr;
+
+        // ------------------------------------------------------------
+        // Stride (primary binding = the one attribute 0 reads)
+        // Stays 0 when vertex input or stride is dynamic.
+        // ------------------------------------------------------------
+        if (!strideDyn && vis &&
+            vis->pVertexBindingDescriptions && vis->vertexBindingDescriptionCount > 0)
+        {
+            uint32_t primary = vis->pVertexBindingDescriptions[0].binding;
+            if (vis->pVertexAttributeDescriptions && vis->vertexAttributeDescriptionCount > 0)
+                primary = vis->pVertexAttributeDescriptions[0].binding;
+
+            for (uint32_t b = 0; b < vis->vertexBindingDescriptionCount; ++b)
+            {
+                if (vis->pVertexBindingDescriptions[b].binding == primary)
+                {
+                    e.stride = vis->pVertexBindingDescriptions[b].stride;
+                    break;
+                }
+            }
+        }
+
+        static std::atomic<int> s_strideLogs{ 0 };
+        if (s_strideLogs.fetch_add(1) < 2)
+            Log("pipe %p stride=%u strideDyn=%d vinDyn=%d flags=0x%x",
+                (void*)e.pipe, e.stride, strideDyn ? 1 : 0, vinDyn ? 1 : 0, (unsigned)ci.flags);
+
+        // ------------------------------------------------------------
+        // Key
+        // ------------------------------------------------------------
+        uint64_t key = 0;
+
+        // ---- shader stages ----
+        for (uint32_t s = 0; s < ci.stageCount; ++s)
+        {
+            const VkPipelineShaderStageCreateInfo& st = ci.pStages[s];
+
+            uint64_t h = 0;
+            if (GetModuleHash(st.module, h))
+            {
+                key = combine(key, h);
+            }
+            else
+            {
+                key = combine(key, reinterpret_cast<uint64_t>(st.module));
+                if (kVerboseKeyLog)
+                    Log("CreateGP: module %p not in g_moduleHash (using handle)", (void*)st.module);
+            }
+
+            key = combine(key, static_cast<uint64_t>(st.stage));
+
+            if (st.pName)
+                for (const char* p = st.pName; *p; ++p)
+                    key = combine(key, static_cast<uint8_t>(*p));
+
+            if (st.pSpecializationInfo)
+            {
+                const VkSpecializationInfo* si = st.pSpecializationInfo;
+
+                if (si->pData && si->dataSize)
+                {
+                    const uint8_t* d = static_cast<const uint8_t*>(si->pData);
+                    for (size_t b = 0; b < si->dataSize; ++b)
+                        key = combine(key, d[b]);
+                }
+
+                if (si->pMapEntries)
+                {
+                    for (uint32_t m = 0; m < si->mapEntryCount; ++m)
+                    {
+                        key = combine(key, si->pMapEntries[m].constantID);
+                        key = combine(key, si->pMapEntries[m].offset);
+                        key = combine(key, si->pMapEntries[m].size);
+                    }
+                }
+            }
+        }
+
+        // ---- vertex input (guarded: vis is null when vertex input is dynamic) ----
+        if (vis)
+        {
+            if (vis->pVertexBindingDescriptions)
+            {
+                for (uint32_t b = 0; b < vis->vertexBindingDescriptionCount; ++b)
+                {
+                    key = combine(key, vis->pVertexBindingDescriptions[b].binding);
+                    key = combine(key, vis->pVertexBindingDescriptions[b].stride);
+                    key = combine(key, vis->pVertexBindingDescriptions[b].inputRate);
+                }
+            }
+
+            if (vis->pVertexAttributeDescriptions)
+            {
+                for (uint32_t a = 0; a < vis->vertexAttributeDescriptionCount; ++a)
+                {
+                    key = combine(key, vis->pVertexAttributeDescriptions[a].location);
+                    key = combine(key, vis->pVertexAttributeDescriptions[a].binding);
+                    key = combine(key, vis->pVertexAttributeDescriptions[a].format);
+                    key = combine(key, vis->pVertexAttributeDescriptions[a].offset);
+                }
+            }
+        }
+
+        // ---- additional pipeline state ----
+        if (ci.pInputAssemblyState)
+        {
+            key = combine(key, ci.pInputAssemblyState->topology);
+            key = combine(key, ci.pInputAssemblyState->primitiveRestartEnable ? 1ull : 0ull);
+        }
+
+        if (ci.pRasterizationState)
+        {
+            key = combine(key, ci.pRasterizationState->polygonMode);
+            key = combine(key, ci.pRasterizationState->cullMode);
+            key = combine(key, ci.pRasterizationState->frontFace);
+            key = combine(key, ci.pRasterizationState->depthBiasEnable ? 1ull : 0ull);
+        }
+
+        if (ci.pMultisampleState)
+            key = combine(key, ci.pMultisampleState->rasterizationSamples);
+
+        if (ci.pDepthStencilState)
+        {
+            key = combine(key, ci.pDepthStencilState->depthTestEnable ? 1ull : 0ull);
+            key = combine(key, ci.pDepthStencilState->depthWriteEnable ? 1ull : 0ull);
+            key = combine(key, ci.pDepthStencilState->depthCompareOp);
+        }
+
+        if (ci.pColorBlendState && ownsFragmentOutput && ci.pColorBlendState->pAttachments)
+        {
+            key = combine(key, ci.pColorBlendState->attachmentCount);
+            for (uint32_t a = 0; a < ci.pColorBlendState->attachmentCount; ++a)
+            {
+                const auto& att = ci.pColorBlendState->pAttachments[a];
+                key = combine(key, att.blendEnable ? 1ull : 0ull);
+                key = combine(key, att.colorWriteMask);
+            }
+        }
+
+        if (key == 0)
+            key = combine(key, 0xDEADBEEFCAFEBABEull);
+
+        e.key = key;
+
+        if (kVerboseKeyLog)
+            Log("CreateGP: pipeline=%p stages=%u key=%llu", (void*)e.pipe, ci.stageCount, key);
+
+        // ------------------------------------------------------------
+        // Highlight clone: only for pipelines we care about.
+        // Cloning EVERY pipeline doubles compile cost and causes hitches.
+        //
+        // With dynamic vertex input (VK_EXT_vertex_input_dynamic_state) or
+        // dynamic stride, e.stride is 0 here, so we can't pre-filter by stride.
+        // Those pipelines are cloned too (only if they have a fragment stage),
+        // and the draw detour must filter them using the stride that is
+        // actually set at draw time.
+        // ------------------------------------------------------------
+        bool hasFragStage = false;
+        for (uint32_t s = 0; s < ci.stageCount; ++s)
+        {
+            if (ci.pStages[s].stage == VK_SHADER_STAGE_FRAGMENT_BIT)
+            {
+                hasFragStage = true;
+                break;
+            }
+        }
+
+        const bool strideUnknown = vinDyn || strideDyn;
+
+        const bool canClone =
+            (e.stride == kHighlightStride || strideUnknown) &&
+            hasFragStage &&
+            !isLinked &&
+            !(ci.flags & VK_PIPELINE_CREATE_LIBRARY_BIT_KHR) &&
+            ownsFragmentOutput &&
+            ci.pColorBlendState &&
+            ci.pColorBlendState->attachmentCount > 0 &&
+            ci.pColorBlendState->pAttachments;
+
+        if (canClone)
+        {
+            VkGraphicsPipelineCreateInfo highlightCI = ci;
+            highlightCI.flags &= ~(VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT |
+                VK_PIPELINE_CREATE_DERIVATIVE_BIT);
+            highlightCI.basePipelineHandle = VK_NULL_HANDLE;
+            highlightCI.basePipelineIndex = -1;
+
+            // These locals stay alive until after the create call below
+            std::vector<VkPipelineColorBlendAttachmentState> attachments(
+                ci.pColorBlendState->pAttachments,
+                ci.pColorBlendState->pAttachments + ci.pColorBlendState->attachmentCount);
+
+            for (auto& att : attachments)
+            {
+                att.blendEnable = VK_TRUE;
+                att.srcColorBlendFactor = VK_BLEND_FACTOR_CONSTANT_COLOR;
+                att.dstColorBlendFactor = VK_BLEND_FACTOR_ZERO;
+                att.colorBlendOp = VK_BLEND_OP_ADD;
+                att.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+                att.dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
+                att.alphaBlendOp = VK_BLEND_OP_ADD;
+            }
+
+            VkPipelineColorBlendStateCreateInfo blendState = *ci.pColorBlendState;
+            blendState.pAttachments = attachments.data();
+            blendState.blendConstants[0] = 1.0f;   // R
+            blendState.blendConstants[1] = 0.0f;   // G
+            blendState.blendConstants[2] = 0.0f;   // B
+            blendState.blendConstants[3] = 1.0f;   // A
+            highlightCI.pColorBlendState = &blendState;
+
+            // The game never calls vkCmdSetBlendConstants, so the clone must use the
+            // STATIC red above: drop BLEND_CONSTANTS from the dynamic states.
+            // All other dynamic states (incl. VERTEX_INPUT_EXT and
+            // VERTEX_INPUT_BINDING_STRIDE) are kept, so the clone accepts the
+            // game's dynamic vertex input / stride at draw time.
+            std::vector<VkDynamicState> dynStates;
+            VkPipelineDynamicStateCreateInfo dynInfo{};
+            if (ci.pDynamicState && ci.pDynamicState->pDynamicStates)
+            {
+                for (uint32_t d = 0; d < ci.pDynamicState->dynamicStateCount; ++d)
+                    if (ci.pDynamicState->pDynamicStates[d] != VK_DYNAMIC_STATE_BLEND_CONSTANTS)
+                        dynStates.push_back(ci.pDynamicState->pDynamicStates[d]);
+
+                dynInfo = *ci.pDynamicState;
+                dynInfo.dynamicStateCount = static_cast<uint32_t>(dynStates.size());
+                dynInfo.pDynamicStates = dynStates.empty() ? nullptr : dynStates.data();
+                highlightCI.pDynamicState = &dynInfo;
+            }
+
+            VkPipeline highlightPipe = VK_NULL_HANDLE;
+            VkResult hr = pOriginalCreateGraphicsPipelines(
+                device, cache, 1, &highlightCI, pAllocator, &highlightPipe);
+
+            if (hr == VK_SUCCESS && highlightPipe != VK_NULL_HANDLE)
+            {
+                e.highlight = highlightPipe;
+                if (kVerboseKeyLog)
+                    Log("CreateGP: created highlight pipeline %p for original %p",
+                        (void*)highlightPipe, (void*)e.pipe);
+            }
+            else
+            {
+                static std::atomic<int> s_failLogs{ 0 };
+                if (s_failLogs.fetch_add(1) < 20)
+                    Log("highlight create FAILED hr=%d for %p", (int)hr, (void*)e.pipe);
+            }
+        }
+
+        entries.push_back(e);
+    }
+
+    // ------------------------------------------------------------
+    // ONE short lock, map writes only
+    // ------------------------------------------------------------
+    {
+        std::lock_guard<std::mutex> lock(g_mtx);
+        for (const Entry& e : entries)
+        {
+            g_pipelineStrides[e.pipe] = e.stride;
+            g_pipelineKey[e.pipe] = e.key;
+
+            if (e.highlight != VK_NULL_HANDLE)
+                g_highlightPipelines[e.pipe] = e.highlight;
+            else
+                g_highlightPipelines.erase(e.pipe);   // never keep a stale clone for a reused handle
+        }
+    }
+
+    return r;
+}
+
+/*
 VKAPI_ATTR VkResult VKAPI_CALL DetourVkCreateGraphicsPipelines(
     VkDevice device,
     VkPipelineCache cache,
@@ -552,6 +914,7 @@ VKAPI_ATTR VkResult VKAPI_CALL DetourVkCreateGraphicsPipelines(
 
     return r;
 }
+*/
 
 //===================================================================================================//
 
@@ -656,17 +1019,6 @@ void VKAPI_CALL DetourVkCmdSetVertexInputEXT(
 }
 
 //===================================================================================================//
-/*
-VkPipeline g_TargetPipe = VK_NULL_HANDLE;   // real handle (optional, for exact match)
-uint32_t   g_TargetPipeID = 0;              // short ID (0-99) that you bruteforce
-
-inline uint32_t GetPipeShortID(VkPipeline pipe)
-{
-    if (pipe == VK_NULL_HANDLE)
-        return 0;
-    return (reinterpret_cast<uintptr_t>(pipe) >> 12) % 100;
-}
-*/
 
 void VKAPI_CALL DetourVkCmdDrawIndexed(VkCommandBuffer cmd, uint32_t idxCount, uint32_t instCount, uint32_t firstIdx, int32_t vtxOff, uint32_t firstInst) {
 
@@ -753,154 +1105,6 @@ void VKAPI_CALL DetourVkCmdDrawIndexed(VkCommandBuffer cmd, uint32_t idxCount, u
         }
         
     }
-
-
-
-
-
-    /*
-    std::lock_guard<std::mutex> lock(g_mtx);
-
-    auto pipeIt = g_curPipeline.find(cmd);
-
-    //Log("1");
-
-    if (pipeIt == g_curPipeline.end())
-    {
-        //Log("NO PIPELINE");
-        pOriginalCmdDrawIndexed(
-            cmd, idxCount, instCount,
-            firstIdx, vtxOff, firstInst);
-        return;
-    }
-
-    //Log("PIPELINE FOUND");
-
-    VkPipeline currentPipe = pipeIt->second;
-
-    //Log("stride=%zu", stride);
-
-    if (stride <= 0 || stride != 40)
-    {
-        //Log("STRIDE FAILED");
-        pOriginalCmdDrawIndexed(
-            cmd, idxCount, instCount,
-            firstIdx, vtxOff, firstInst);
-        return;
-    }
-
-    //Log("STRIDE OK");
-
-    auto hlIt = g_highlightPipelines.find(currentPipe);
-
-    if (hlIt == g_highlightPipelines.end())
-    {
-        //Log("NO HIGHLIGHT PIPELINE");
-        pOriginalCmdDrawIndexed(
-            cmd, idxCount, instCount,
-            firstIdx, vtxOff, firstInst);
-        return;
-    }
-
-    Log("HIGHLIGHT PIPELINE FOUND");
-
-    VkPipeline highlightPipe = hlIt->second;
-
-    pOriginalCmdBindPipeline(
-        cmd,
-        VK_PIPELINE_BIND_POINT_GRAPHICS,
-        highlightPipe
-    );
-
-    Log("HIGHLIGHT PIPELINE BOUND");
-
-    const float redColor[4] = {
-        1.0f, 0.0f, 0.0f, 1.0f
-    };
-
-    vkCmdSetBlendConstants(cmd, redColor);
-
-    Log("BLEND CONSTANT SET");
-
-    pOriginalCmdDrawIndexed(
-        cmd,
-        idxCount,
-        instCount,
-        firstIdx,
-        vtxOff,
-        firstInst
-    );
-
-    Log("HIGHLIGHT DRAW");
-
-    pOriginalCmdBindPipeline(
-        cmd,
-        VK_PIPELINE_BIND_POINT_GRAPHICS,
-        currentPipe
-    );
-
-    */
-
-    /*
-    //pipeline
-    std::lock_guard<std::mutex> lock(g_mtx);
-
-    auto pipeIt = g_curPipeline.find(cmd);
-    if (pipeIt == g_curPipeline.end())
-    {
-        Log("no pipeline known");
-        // no pipeline known → just draw normally
-        pOriginalCmdDrawIndexed(cmd, idxCount, instCount, firstIdx, vtxOff, firstInst);
-        return;
-    }
-
-
-    //std::lock_guard<std::mutex> lock(g_mtx);
-    //Log("stride == %d", stride);
-    // Find the currently bound pipeline for this command buffer
-    auto curIt = g_curPipeline.find(cmd);
-    {
-        Log("1");
-        if (curIt != g_curPipeline.end() && stride > 0 && stride == 48)
-        {
-            Log("2");
-            VkPipeline currentPipe = curIt->second;
-
-            // Check if a highlight version exists for the bound pipeline
-            auto hlIt = g_highlightPipelines.find(currentPipe);
-            if (hlIt != g_highlightPipelines.end())
-            {
-                Log("3");
-                VkPipeline highlightPipe = hlIt->second;
-
-                // 1) Bind the solid-color highlight pipeline
-                pOriginalCmdBindPipeline(
-                    cmd,
-                    VK_PIPELINE_BIND_POINT_GRAPHICS,
-                    highlightPipe
-                );
-
-                // 2) Set your custom RGBA color (e.g., Red: 1.0, 0.0, 0.0, 1.0)
-                const float redColor[4] = { 255.0f, 0.0f, 0.0f, 1.0f };
-                vkCmdSetBlendConstants(cmd, redColor);
-
-                // 3) Draw with the highlight pipeline
-                pOriginalCmdDrawIndexed(cmd, idxCount, instCount, firstIdx, vtxOff, firstInst);
-
-                // 4) Restore original pipeline state back to the command buffer
-                pOriginalCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, currentPipe);
-
-                return;
-            }
-            //else
-            //{
-                // Reset blend constants back to default white for normal rendering
-                //const float defaultColor[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
-                //vkCmdSetBlendConstants(cmd, defaultColor);
-            //}
-        }
-    }
-    */
 
     pOriginalCmdDrawIndexed(cmd, idxCount, instCount, firstIdx, vtxOff, firstInst);
 }
