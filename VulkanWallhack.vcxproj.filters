@@ -38,9 +38,6 @@
     </ClCompile>
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="main.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
     <ClInclude Include="minhook\src\buffer.h">
       <Filter>Resource Files\minhook</Filter>
     </ClInclude>

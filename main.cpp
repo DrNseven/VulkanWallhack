@@ -1,4 +1,4 @@
-﻿// Vulkan Hook (Valheim Hack)
+﻿// Vulkan Hook/Wallhack
 #define NOMINMAX
 #include <Windows.h>
 #include <iostream>
@@ -36,36 +36,7 @@ inline void Log(const char* fmt, ...) {
     }
 }
 
-#include <set> 
-static void LogRequest(const char* which, const char* name)
-{
-    if (!which || !name) return;
-
-    // FNV-1a hash of "which:name"
-    uint32_t h = 2166136261u;
-    for (const char* p = which; *p; ++p) h = (h ^ (uint8_t)*p) * 16777619u;
-    h = (h ^ ':') * 16777619u;
-    for (const char* p = name; *p; ++p)  h = (h ^ (uint8_t)*p) * 16777619u;
-
-    static std::atomic<uint32_t> seen[512];
-    static std::atomic<uint32_t> count{ 0 };
-
-    uint32_t n = count.load();
-    if (n > 512) n = 512;
-    for (uint32_t i = 0; i < n; ++i)
-        if (seen[i].load() == h) return;            // already logged
-
-    uint32_t idx = count.fetch_add(1);
-    if (idx >= 512) return;
-    seen[idx].store(h);
-
-    Log("%s requested: %s", which, name);           // log only names we haven't seen
-}
-
-//Dynamic colors option (not for valheim, but for deadlock)
-PFN_vkCmdSetColorBlendEnableEXT pfnCmdSetColorBlendEnableEXT = nullptr;
-PFN_vkCmdSetColorBlendEquationEXT pfnCmdSetColorBlendEquationEXT = nullptr;
-
+//===================================================================================================//
 
 // Function Pointers
 typedef PFN_vkVoidFunction(VKAPI_PTR* PFN_vkGetDeviceProcAddr)(VkDevice device, const char* pName);
@@ -82,7 +53,7 @@ typedef void (VKAPI_PTR* PFN_vkCmdDrawIndexedIndirectCount)(VkCommandBuffer, VkB
 typedef void (VKAPI_PTR* PFN_vkCmdBindDescriptorSets)(VkCommandBuffer, VkPipelineBindPoint, VkPipelineLayout, uint32_t, uint32_t, const VkDescriptorSet*, uint32_t, const uint32_t*);
 typedef VkResult(VKAPI_PTR* PFN_vkCreateShaderModule)(VkDevice device,const VkShaderModuleCreateInfo* pCreateInfo,const VkAllocationCallbacks* pAllocator,VkShaderModule* pModule);
 
-// Typedefs for the new hooks
+// Typedefs
 PFN_vkGetDeviceProcAddr pOriginalGetDeviceProcAddr = nullptr;
 PFN_vkGetInstanceProcAddr pOriginalGetInstanceProcAddr = nullptr;
 PFN_vkCreateGraphicsPipelines pOriginalCreateGraphicsPipelines = nullptr;
@@ -97,10 +68,10 @@ PFN_vkCmdDrawIndexedIndirectCount pOriginalCmdDrawIndexedIndirectCount = nullptr
 PFN_vkCmdBindDescriptorSets pOriginalCmdBindDescriptorSets = nullptr;
 PFN_vkCreateShaderModule pOriginalCreateShaderModule = nullptr;
 
-// Dynamic State Setters 
-PFN_vkCmdSetDepthTestEnable  gp_vkCmdSetDepthTestEnable = nullptr;
-PFN_vkCmdSetDepthWriteEnable gp_vkCmdSetDepthWriteEnable = nullptr;
-PFN_vkCmdSetDepthCompareOp   gp_vkCmdSetDepthCompareOp = nullptr;
+//===================================================================================================//
+
+// Toggle for the diagnostic Log() calls below
+static constexpr bool kVerboseKeyLog = false;
 
 // Viewport, Command Buffer State
 struct CmdState {
@@ -111,15 +82,13 @@ struct CmdState {
 std::unordered_map<VkCommandBuffer, CmdState> cmdStates;
 std::shared_mutex statesMtx;
 
-//Other
+//===================================================================================================//
+
+//Pipeline key
 static std::mutex g_mtx;
-//std::recursive_mutex g_mtx; // Replace std::mutex with std::recursive_mutex
-static std::unordered_map<VkShaderModule, size_t>    g_moduleSize;   // module -> codeSize
 static std::unordered_map<VkPipeline, uint64_t>      g_pipelineKey;  // pipeline -> key
 static std::unordered_map<VkCommandBuffer, uint64_t> g_curKey;       // cmd -> key of bound graphics pipeline
-
-// Toggle for the diagnostic Log() calls below
-static constexpr bool kVerboseKeyLog = false;
+static std::unordered_map<VkShaderModule, uint64_t> g_moduleHash;  // module → content hash
 
 // Hash helper (64-bit mix)
 static uint64_t combine(uint64_t seed, uint64_t v) {
@@ -130,15 +99,11 @@ static uint64_t combine(uint64_t seed, uint64_t v) {
     return seed ^ (v + 0x9e3779b97f4a7c15ULL + (seed << 6) + (seed >> 2));
 }
 
-// map to store a content hash
-static std::unordered_map<VkShaderModule, uint64_t> g_moduleHash;  // module → content hash
+//===================================================================================================//
 
+// Stride (dynamic version)
+std::unordered_map<VkCommandBuffer, uint32_t> g_cmdBufStride;
 
-
-// Stride
-// Global / singleton / thread-local map (use a lock if multiple threads record)
-std::unordered_map<VkCommandBuffer, uint32_t> g_cmdBufStride;          // simple
-// or better:
 struct VertexInputState {
     uint32_t bindingCount = 0;
     std::vector<VkVertexInputBindingDescription2EXT> bindings;
@@ -158,17 +123,6 @@ VKAPI_ATTR VkResult VKAPI_CALL DetourVkCreateShaderModule(
         Log("CreateShaderModule");
         loggedOnce = true;
     }
-
-    /*
-    VkResult r = pOriginalCreateShaderModule(device, pCreateInfo, pAllocator, pModule);
-    if (r == VK_SUCCESS && pModule && *pModule != VK_NULL_HANDLE && pCreateInfo) {
-        std::lock_guard<std::mutex> lock(g_mtx);
-        g_moduleSize[*pModule] = pCreateInfo->codeSize;
-        if (kVerboseKeyLog)
-            Log("CreateShaderModule: module=%p size=%zu", (void*)*pModule, pCreateInfo->codeSize);
-    }
-    return r;
-    */
 
     VkResult r = pOriginalCreateShaderModule(device, pCreateInfo, pAllocator, pModule);
     if (r == VK_SUCCESS && pModule && *pModule != VK_NULL_HANDLE && pCreateInfo && pCreateInfo->pCode) {
@@ -194,21 +148,13 @@ VKAPI_ATTR VkResult VKAPI_CALL DetourVkCreateShaderModule(
 
 //===================================================================================================//
 
-// Add these globals near your other maps
+// Maps
 std::unordered_map<VkPipeline, VkPipeline> g_highlightPipelines;   // original → colored version
 std::unordered_map<VkCommandBuffer, VkPipeline> g_curPipeline;   // currently bound graphics pipeline
-
-// Correct Map Declaration (Nested Map)
 std::unordered_map<VkPipeline, uint32_t> g_pipelineStrides; // pipeline -> binding 0 stride
-std::unordered_map<VkCommandBuffer, std::unordered_map<uint32_t, uint32_t>> g_cmdBufStrides;
 
 
-
-static constexpr uint32_t kHighlightStride = 40;   // models
-
-// Set to true ONLY if the game's device enabled VK_EXT_extended_dynamic_state
-// (or Vulkan 1.3). Needed for the optional depth states (wallhack).
-static bool gGameEnabledExtDynState = false;
+static constexpr uint32_t kHighlightStride = 40;   // 
 
 // Short lock, lookup only, no calls made while it is held
 static bool GetModuleHash(VkShaderModule m, uint64_t& out)
@@ -221,6 +167,7 @@ static bool GetModuleHash(VkShaderModule m, uint64_t& out)
     return true;
 }
 
+//===================================================================================================//
 
 VKAPI_ATTR VkResult VKAPI_CALL DetourVkCreateGraphicsPipelines(
     VkDevice device,
@@ -333,7 +280,7 @@ VKAPI_ATTR VkResult VKAPI_CALL DetourVkCreateGraphicsPipelines(
         }
 
         static std::atomic<int> s_strideLogs{ 0 };
-        if (s_strideLogs.fetch_add(1) < 2)
+        if (s_strideLogs.fetch_add(1) < 1)
             Log("pipe %p stride=%u strideDyn=%d vinDyn=%d flags=0x%x",
                 (void*)e.pipe, e.stride, strideDyn ? 1 : 0, vinDyn ? 1 : 0, (unsigned)ci.flags);
 
@@ -491,6 +438,7 @@ VKAPI_ATTR VkResult VKAPI_CALL DetourVkCreateGraphicsPipelines(
 
         if (canClone)
         {
+            //Log("Canclone");
             VkGraphicsPipelineCreateInfo highlightCI = ci;
             highlightCI.flags &= ~(VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT |
                 VK_PIPELINE_CREATE_DERIVATIVE_BIT);
@@ -511,11 +459,12 @@ VKAPI_ATTR VkResult VKAPI_CALL DetourVkCreateGraphicsPipelines(
                 att.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
                 att.dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
                 att.alphaBlendOp = VK_BLEND_OP_ADD;
+                //att.colorWriteMask = (VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_A_BIT);
             }
 
             VkPipelineColorBlendStateCreateInfo blendState = *ci.pColorBlendState;
             blendState.pAttachments = attachments.data();
-            blendState.blendConstants[0] = 1.0f;   // R
+            blendState.blendConstants[0] = 55.0f;   // R
             blendState.blendConstants[1] = 0.0f;   // G
             blendState.blendConstants[2] = 0.0f;   // B
             blendState.blendConstants[3] = 1.0f;   // A
@@ -582,340 +531,6 @@ VKAPI_ATTR VkResult VKAPI_CALL DetourVkCreateGraphicsPipelines(
     return r;
 }
 
-/*
-VKAPI_ATTR VkResult VKAPI_CALL DetourVkCreateGraphicsPipelines(
-    VkDevice device,
-    VkPipelineCache cache,
-    uint32_t count,
-    const VkGraphicsPipelineCreateInfo* pCreateInfos,
-    const VkAllocationCallbacks* pAllocator,
-    VkPipeline* pPipelines)
-{
-    static std::atomic<bool> s_loggedOnce{ false };
-    if (!s_loggedOnce.exchange(true))
-        Log("DetourVkCreateGraphicsPipelines");
-
-    // 1) Create the original pipelines first
-    VkResult r = pOriginalCreateGraphicsPipelines(device, cache, count, pCreateInfos, pAllocator, pPipelines);
-
-    // Don't bail on r != VK_SUCCESS: partial results (e.g. VK_PIPELINE_COMPILE_REQUIRED)
-    // still leave valid handles in pPipelines. Each handle is checked below.
-    if (!pCreateInfos || !pPipelines || count == 0)
-        return r;
-
-    struct Entry
-    {
-        VkPipeline pipe = VK_NULL_HANDLE;
-        uint32_t   stride = 0;
-        uint64_t   key = 0;
-        VkPipeline highlight = VK_NULL_HANDLE;
-    };
-    std::vector<Entry> entries;
-    entries.reserve(count);
-
-    // NO lock is held while we compute, hash, or create clones.
-    for (uint32_t i = 0; i < count; ++i)
-    {
-        if (pPipelines[i] == VK_NULL_HANDLE)
-            continue;
-
-        const VkGraphicsPipelineCreateInfo& ci = pCreateInfos[i];
-
-        Entry e;
-        e.pipe = pPipelines[i];
-
-        // ------------------------------------------------------------
-        // Dynamic-state flags
-        // ------------------------------------------------------------
-        bool strideDyn = false;
-        bool vinDyn = false;
-
-        if (ci.pDynamicState && ci.pDynamicState->pDynamicStates)
-        {
-            for (uint32_t d = 0; d < ci.pDynamicState->dynamicStateCount; ++d)
-            {
-                const VkDynamicState s = ci.pDynamicState->pDynamicStates[d];
-                if (s == VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE) strideDyn = true;
-                if (s == VK_DYNAMIC_STATE_VERTEX_INPUT_EXT)            vinDyn = true;
-            }
-        }
-
-        // ------------------------------------------------------------
-        // Pipeline-library awareness (state in a library is ignored
-        // unless that library owns it)
-        // ------------------------------------------------------------
-        bool hasGplInfo = false;
-        VkGraphicsPipelineLibraryFlagsEXT gplFlags = 0;
-        bool isLinked = false;
-
-        for (auto p = static_cast<const VkBaseInStructure*>(ci.pNext); p; p = p->pNext)
-        {
-            if (p->sType == VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_LIBRARY_CREATE_INFO_EXT)
-            {
-                hasGplInfo = true;
-                gplFlags = reinterpret_cast<const VkGraphicsPipelineLibraryCreateInfoEXT*>(p)->flags;
-            }
-            else if (p->sType == VK_STRUCTURE_TYPE_PIPELINE_LIBRARY_CREATE_INFO_KHR)
-            {
-                if (reinterpret_cast<const VkPipelineLibraryCreateInfoKHR*>(p)->libraryCount > 0)
-                    isLinked = true;
-            }
-        }
-
-        const bool ownsVertexInput =
-            !hasGplInfo || (gplFlags & VK_GRAPHICS_PIPELINE_LIBRARY_VERTEX_INPUT_INTERFACE_BIT_EXT);
-        const bool ownsFragmentOutput =
-            !hasGplInfo || (gplFlags & VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_OUTPUT_INTERFACE_BIT_EXT);
-
-        // pVertexInputState is only meaningful in these cases; otherwise it may be null/junk
-        const VkPipelineVertexInputStateCreateInfo* vis =
-            (!vinDyn && ownsVertexInput) ? ci.pVertexInputState : nullptr;
-
-        // ------------------------------------------------------------
-        // Stride (primary binding = the one attribute 0 reads)
-        // ------------------------------------------------------------
-        if (!strideDyn && vis &&
-            vis->pVertexBindingDescriptions && vis->vertexBindingDescriptionCount > 0)
-        {
-            uint32_t primary = vis->pVertexBindingDescriptions[0].binding;
-            if (vis->pVertexAttributeDescriptions && vis->vertexAttributeDescriptionCount > 0)
-                primary = vis->pVertexAttributeDescriptions[0].binding;
-
-            for (uint32_t b = 0; b < vis->vertexBindingDescriptionCount; ++b)
-            {
-                if (vis->pVertexBindingDescriptions[b].binding == primary)
-                {
-                    e.stride = vis->pVertexBindingDescriptions[b].stride;
-                    break;
-                }
-            }
-        }
-
-        static std::atomic<int> s_strideLogs{ 0 };
-        if (s_strideLogs.fetch_add(1) < 2)
-            Log("pipe %p stride=%u strideDyn=%d vinDyn=%d flags=0x%x",
-                (void*)e.pipe, e.stride, strideDyn ? 1 : 0, vinDyn ? 1 : 0, (unsigned)ci.flags);
-
-        // ------------------------------------------------------------
-        // Key
-        // ------------------------------------------------------------
-        uint64_t key = 0;
-
-        // ---- shader stages ----
-        for (uint32_t s = 0; s < ci.stageCount; ++s)
-        {
-            const VkPipelineShaderStageCreateInfo& st = ci.pStages[s];
-
-            uint64_t h = 0;
-            if (GetModuleHash(st.module, h))
-            {
-                key = combine(key, h);
-            }
-            else
-            {
-                key = combine(key, reinterpret_cast<uint64_t>(st.module));
-                if (kVerboseKeyLog)
-                    Log("CreateGP: module %p not in g_moduleHash (using handle)", (void*)st.module);
-            }
-
-            key = combine(key, static_cast<uint64_t>(st.stage));
-
-            if (st.pName)
-                for (const char* p = st.pName; *p; ++p)
-                    key = combine(key, static_cast<uint8_t>(*p));
-
-            if (st.pSpecializationInfo)
-            {
-                const VkSpecializationInfo* si = st.pSpecializationInfo;
-                if (si->pData && si->dataSize)
-                {
-                    const uint8_t* d = static_cast<const uint8_t*>(si->pData);
-                    for (size_t b = 0; b < si->dataSize; ++b)
-                        key = combine(key, d[b]);
-                }
-                if (si->pMapEntries)
-                {
-                    for (uint32_t m = 0; m < si->mapEntryCount; ++m)
-                    {
-                        key = combine(key, si->pMapEntries[m].constantID);
-                        key = combine(key, si->pMapEntries[m].offset);
-                        key = combine(key, si->pMapEntries[m].size);
-                    }
-                }
-            }
-        }
-
-        // ---- vertex input (guarded: vis is null when vertex input is dynamic) ----
-        if (vis)
-        {
-            if (vis->pVertexBindingDescriptions)
-            {
-                for (uint32_t b = 0; b < vis->vertexBindingDescriptionCount; ++b)
-                {
-                    key = combine(key, vis->pVertexBindingDescriptions[b].binding);
-                    key = combine(key, vis->pVertexBindingDescriptions[b].stride);
-                    key = combine(key, vis->pVertexBindingDescriptions[b].inputRate);
-                }
-            }
-            if (vis->pVertexAttributeDescriptions)
-            {
-                for (uint32_t a = 0; a < vis->vertexAttributeDescriptionCount; ++a)
-                {
-                    key = combine(key, vis->pVertexAttributeDescriptions[a].location);
-                    key = combine(key, vis->pVertexAttributeDescriptions[a].binding);
-                    key = combine(key, vis->pVertexAttributeDescriptions[a].format);
-                    key = combine(key, vis->pVertexAttributeDescriptions[a].offset);
-                }
-            }
-        }
-
-        // ---- additional pipeline state ----
-        if (ci.pInputAssemblyState)
-        {
-            key = combine(key, ci.pInputAssemblyState->topology);
-            key = combine(key, ci.pInputAssemblyState->primitiveRestartEnable ? 1ull : 0ull);
-        }
-        if (ci.pRasterizationState)
-        {
-            key = combine(key, ci.pRasterizationState->polygonMode);
-            key = combine(key, ci.pRasterizationState->cullMode);
-            key = combine(key, ci.pRasterizationState->frontFace);
-            key = combine(key, ci.pRasterizationState->depthBiasEnable ? 1ull : 0ull);
-        }
-        if (ci.pMultisampleState)
-            key = combine(key, ci.pMultisampleState->rasterizationSamples);
-        if (ci.pDepthStencilState)
-        {
-            key = combine(key, ci.pDepthStencilState->depthTestEnable ? 1ull : 0ull);
-            key = combine(key, ci.pDepthStencilState->depthWriteEnable ? 1ull : 0ull);
-            key = combine(key, ci.pDepthStencilState->depthCompareOp);
-        }
-        if (ci.pColorBlendState && ownsFragmentOutput && ci.pColorBlendState->pAttachments)
-        {
-            key = combine(key, ci.pColorBlendState->attachmentCount);
-            for (uint32_t a = 0; a < ci.pColorBlendState->attachmentCount; ++a)
-            {
-                const auto& att = ci.pColorBlendState->pAttachments[a];
-                key = combine(key, att.blendEnable ? 1ull : 0ull);
-                key = combine(key, att.colorWriteMask);
-            }
-        }
-
-        if (key == 0)
-            key = combine(key, 0xDEADBEEFCAFEBABEull);
-
-        e.key = key;
-
-        if (kVerboseKeyLog)
-            Log("CreateGP: pipeline=%p stages=%u key=%llu", (void*)e.pipe, ci.stageCount, key);
-
-        // ------------------------------------------------------------
-        // Highlight clone: only for pipelines we care about.
-        // Cloning EVERY pipeline doubles compile cost and causes hitches.
-        // ------------------------------------------------------------
-        const bool canClone =
-            e.stride == kHighlightStride &&
-            !isLinked &&
-            !(ci.flags & VK_PIPELINE_CREATE_LIBRARY_BIT_KHR) &&
-            ownsFragmentOutput &&
-            ci.pColorBlendState &&
-            ci.pColorBlendState->attachmentCount > 0 &&
-            ci.pColorBlendState->pAttachments;
-
-        if (canClone)
-        {
-            VkGraphicsPipelineCreateInfo highlightCI = ci;
-
-            highlightCI.flags &= ~(VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT |
-                VK_PIPELINE_CREATE_DERIVATIVE_BIT);
-            highlightCI.basePipelineHandle = VK_NULL_HANDLE;
-            highlightCI.basePipelineIndex = -1;
-
-            // These locals stay alive until after the create call below
-            std::vector<VkPipelineColorBlendAttachmentState> attachments(
-                ci.pColorBlendState->pAttachments,
-                ci.pColorBlendState->pAttachments + ci.pColorBlendState->attachmentCount);
-
-            for (auto& att : attachments)
-            {
-                att.blendEnable = VK_TRUE;
-                att.srcColorBlendFactor = VK_BLEND_FACTOR_CONSTANT_COLOR;
-                att.dstColorBlendFactor = VK_BLEND_FACTOR_ZERO;
-                att.colorBlendOp = VK_BLEND_OP_ADD;
-                att.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
-                att.dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
-                att.alphaBlendOp = VK_BLEND_OP_ADD;
-            }
-
-            VkPipelineColorBlendStateCreateInfo blendState = *ci.pColorBlendState;
-            blendState.pAttachments = attachments.data();
-            blendState.blendConstants[0] = 1.0f;   // R
-            blendState.blendConstants[1] = 0.0f;   // G
-            blendState.blendConstants[2] = 0.0f;   // B
-            blendState.blendConstants[3] = 1.0f;   // A
-            highlightCI.pColorBlendState = &blendState;
-
-            // The game never calls vkCmdSetBlendConstants, so the clone must use the
-            // STATIC red above: drop BLEND_CONSTANTS from the dynamic states.
-            std::vector<VkDynamicState> dynStates;
-            VkPipelineDynamicStateCreateInfo dynInfo{};
-
-            if (ci.pDynamicState && ci.pDynamicState->pDynamicStates)
-            {
-                for (uint32_t d = 0; d < ci.pDynamicState->dynamicStateCount; ++d)
-                    if (ci.pDynamicState->pDynamicStates[d] != VK_DYNAMIC_STATE_BLEND_CONSTANTS)
-                        dynStates.push_back(ci.pDynamicState->pDynamicStates[d]);
-
-                dynInfo = *ci.pDynamicState;
-                dynInfo.dynamicStateCount = static_cast<uint32_t>(dynStates.size());
-                dynInfo.pDynamicStates = dynStates.empty() ? nullptr : dynStates.data();
-                highlightCI.pDynamicState = &dynInfo;
-            }
-
-            VkPipeline highlightPipe = VK_NULL_HANDLE;
-            VkResult hr = pOriginalCreateGraphicsPipelines(
-                device, cache, 1, &highlightCI, pAllocator, &highlightPipe);
-
-            if (hr == VK_SUCCESS && highlightPipe != VK_NULL_HANDLE)
-            {
-                e.highlight = highlightPipe;
-                if (kVerboseKeyLog)
-                    Log("CreateGP: created highlight pipeline %p for original %p",
-                        (void*)highlightPipe, (void*)e.pipe);
-            }
-            else
-            {
-                static std::atomic<int> s_failLogs{ 0 };
-                if (s_failLogs.fetch_add(1) < 20)
-                    Log("highlight create FAILED hr=%d for %p", (int)hr, (void*)e.pipe);
-            }
-        }
-
-        entries.push_back(e);
-    }
-
-    // ------------------------------------------------------------
-    // ONE short lock, map writes only
-    // ------------------------------------------------------------
-    {
-        std::lock_guard<std::mutex> lock(g_mtx);
-
-        for (const Entry& e : entries)
-        {
-            g_pipelineStrides[e.pipe] = e.stride;
-            g_pipelineKey[e.pipe] = e.key;
-
-            if (e.highlight != VK_NULL_HANDLE)
-                g_highlightPipelines[e.pipe] = e.highlight;
-            else
-                g_highlightPipelines.erase(e.pipe);   // never keep a stale clone for a reused handle
-        }
-    }
-
-    return r;
-}
-*/
-
 //===================================================================================================//
 
 void VKAPI_CALL DetourVkCmdBindPipeline(VkCommandBuffer cmd, VkPipelineBindPoint bindPoint, VkPipeline pipeline) {
@@ -928,10 +543,29 @@ void VKAPI_CALL DetourVkCmdBindPipeline(VkCommandBuffer cmd, VkPipelineBindPoint
 
     pOriginalCmdBindPipeline(cmd, bindPoint, pipeline);
 
+    if (bindPoint != VK_PIPELINE_BIND_POINT_GRAPHICS ||
+        pipeline == VK_NULL_HANDLE)
+    {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(g_mtx);
+
+    uint64_t key = 0;
+
+    auto it = g_pipelineKey.find(pipeline);
+    if (it != g_pipelineKey.end())
+        key = it->second;
+
+    g_curKey[cmd] = key;
+    g_curPipeline[cmd] = pipeline;
+
+    /*
+    pOriginalCmdBindPipeline(cmd, bindPoint, pipeline);
+
     if (bindPoint == VK_PIPELINE_BIND_POINT_GRAPHICS && pipeline != VK_NULL_HANDLE)
     {
         std::lock_guard<std::mutex> lock(g_mtx);
-        //std::lock_guard<std::recursive_mutex> lock(g_mtx);
 
         // Store both the key AND the actual pipeline handle
         auto it = g_pipelineKey.find(pipeline);
@@ -944,6 +578,7 @@ void VKAPI_CALL DetourVkCmdBindPipeline(VkCommandBuffer cmd, VkPipelineBindPoint
             Log("Bind: cmd=%p pipeline=%p found=%d key=%llu",
                 (void*)cmd, (void*)pipeline, it != g_pipelineKey.end(), key);
     }
+    */
 }
 
 //===================================================================================================//
@@ -1030,12 +665,14 @@ void VKAPI_CALL DetourVkCmdDrawIndexed(VkCommandBuffer cmd, uint32_t idxCount, u
 
 
     uint64_t   key = 0;
-    VkPipeline pipeline = VK_NULL_HANDLE;
-    VkPipeline highPipe = VK_NULL_HANDLE;
-    uint32_t   dstride = 0;   // dynamic (per command buffer)
-    uint32_t   pstride = 0;   // static (per pipeline)
+    VkPipeline original = VK_NULL_HANDLE;
+    VkPipeline highlight = VK_NULL_HANDLE;
+
+    uint32_t dstride = 0;
+    uint32_t pstride = 0;
+
     {
-        std::lock_guard<std::mutex> lock(g_mtx);   // the ONLY lock in this function
+        std::lock_guard<std::mutex> lock(g_mtx);
 
         auto kit = g_curKey.find(cmd);
         if (kit != g_curKey.end())
@@ -1044,27 +681,69 @@ void VKAPI_CALL DetourVkCmdDrawIndexed(VkCommandBuffer cmd, uint32_t idxCount, u
         auto pit = g_curPipeline.find(cmd);
         if (pit != g_curPipeline.end())
         {
-            pipeline = pit->second;
+            original = pit->second;
 
-            auto hit = g_highlightPipelines.find(pipeline);
+            auto hit = g_highlightPipelines.find(original);
             if (hit != g_highlightPipelines.end())
-                highPipe = hit->second;
+                highlight = hit->second;
         }
 
         auto sit = g_cmdBufStride.find(cmd);
         if (sit != g_cmdBufStride.end())
             dstride = sit->second;
 
-        // only touch g_pipelineStrides when there is no dynamic stride
-        if (dstride == 0 && pipeline != VK_NULL_HANDLE)
+        if (dstride == 0 && original != VK_NULL_HANDLE)
         {
-            auto pst = g_pipelineStrides.find(pipeline);
+            auto pst = g_pipelineStrides.find(original);
             if (pst != g_pipelineStrides.end())
                 pstride = pst->second;
         }
-    }   // released; nothing below touches g_mtx
-    const uint32_t shortKey = static_cast<uint32_t>(key % 100);
+    }
+
     const uint32_t stride = dstride ? dstride : pstride;
+
+    // Make the decision completely outside the mutex.
+    const bool shouldHighlight =
+        original != VK_NULL_HANDLE &&
+        highlight != VK_NULL_HANDLE &&
+        stride == 40;
+
+    if (!shouldHighlight)
+    {
+        pOriginalCmdDrawIndexed(
+            cmd,
+            idxCount,
+            instCount,
+            firstIdx,
+            vtxOff,
+            firstInst);
+
+        return;
+    }
+
+    // ------------------------------------------------------------
+    // Highlight draw
+    // ------------------------------------------------------------
+
+    pOriginalCmdBindPipeline(
+        cmd,
+        VK_PIPELINE_BIND_POINT_GRAPHICS,
+        highlight);
+
+    pOriginalCmdDrawIndexed(
+        cmd,
+        idxCount,
+        instCount,
+        firstIdx,
+        vtxOff,
+        firstInst);
+
+    // ------------------------------------------------------------
+    // Restore application pipeline
+    // ------------------------------------------------------------
+
+    //pOriginalCmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,original);
+
   
   
 
@@ -1084,11 +763,9 @@ void VKAPI_CALL DetourVkCmdDrawIndexed(VkCommandBuffer cmd, uint32_t idxCount, u
     //if (shortKey == countnum)
     if(stride > 0 && stride == countnum) //40 = valheim
     {
-        //return;
-        
         if (found && localState.hasViewport) {
 
-            // APPLY HACK
+            // Apply hack
             const VkViewport originalVp = localState.currentViewport;
             VkViewport hVp = originalVp;
 
@@ -1102,9 +779,29 @@ void VKAPI_CALL DetourVkCmdDrawIndexed(VkCommandBuffer cmd, uint32_t idxCount, u
             pOriginalCmdDrawIndexed(cmd, idxCount, instCount, firstIdx, vtxOff, firstInst);
 
             pOriginalCmdSetViewport(cmd, localState.firstViewport, 1, &originalVp);
-        }
-        
+        }    
     }
+
+
+
+
+
+    /*
+    const bool swap = (stride == 40) && highPipe != VK_NULL_HANDLE;
+
+    if (swap)
+    {
+        pOriginalCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, highPipe);
+    //const float blendConstants[4] = { 1.0f, 1.0f, 1.0f, 1.0f }; // red
+    //vkCmdSetBlendConstants(cmd, blendConstants);
+    }
+    //pOriginalCmdDrawIndexed(cmd, idxCount, instCount, firstIdx, vtxOff, firstInst);
+
+    //if (swap)
+      //  pOriginalCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+    */
+   
+
 
     pOriginalCmdDrawIndexed(cmd, idxCount, instCount, firstIdx, vtxOff, firstInst);
 }
@@ -1121,24 +818,6 @@ void VKAPI_CALL DetourVkCmdDrawIndexedIndirect(VkCommandBuffer cmd, VkBuffer buf
     
     return pOriginalCmdDrawIndexedIndirect(cmd, buffer, offset, drawCount, stride);
 }
-
-//===================================================================================================//
-
-/*
-    pfnCmdSetColorBlendEnableEXT = reinterpret_cast<PFN_vkCmdSetColorBlendEnableEXT>(vkGetDeviceProcAddr(device, "vkCmdSetColorBlendEnableEXT"));
-    pfnCmdSetColorBlendEquationEXT = reinterpret_cast<PFN_vkCmdSetColorBlendEquationEXT>(vkGetDeviceProcAddr(device, "vkCmdSetColorBlendEquationEXT"));
-    
-    if (!pfnCmdSetColorBlendEnableEXT ||
-        !pfnCmdSetColorBlendEquationEXT)
-    {
-        static bool loggedOnce = false;
-        if (!loggedOnce) {
-            //this is just the dynamic coloring option that will not work in most games, works in deadlock
-            Log("pfnCmdSetColorBlend Extension/Function isn't available. (It's fine)");
-            loggedOnce = true;
-        }
-    }
-*/
 
 //===================================================================================================//
 
@@ -1174,6 +853,52 @@ static bool HookFn(const char* name, PFN_vkVoidFunction fn, void* detour, void**
     }
     return false;
 }
+
+//===================================================================================================//
+
+static PFN_vkDestroyPipeline pOriginalDestroyPipeline = nullptr;
+
+void VKAPI_CALL DetourVkDestroyPipeline(
+    VkDevice device,
+    VkPipeline pipeline,
+    const VkAllocationCallbacks* pAllocator)
+{
+    static bool loggedOnce = false;
+    if (!loggedOnce)
+    {
+        Log("DetourVkDestroyPipeline");
+        loggedOnce = true;
+    }
+
+    VkPipeline clone = VK_NULL_HANDLE;
+
+    if (pipeline != VK_NULL_HANDLE)
+    {
+        std::lock_guard<std::mutex> lock(g_mtx);
+
+        auto it = g_highlightPipelines.find(pipeline);
+        if (it != g_highlightPipelines.end())
+        {
+            clone = it->second;
+            g_highlightPipelines.erase(it);
+        }
+
+        g_pipelineStrides.erase(pipeline);
+        g_pipelineKey.erase(pipeline);
+    }
+
+    // Destroy the application's pipeline.
+    pOriginalDestroyPipeline(device, pipeline, pAllocator);
+
+    // IMPORTANT:
+    // This is only safe if you know the GPU is no longer using clone.
+    if (clone != VK_NULL_HANDLE)
+    {
+        pOriginalDestroyPipeline(device, clone, pAllocator);
+    }
+}
+
+//===================================================================================================//
 
 static bool HookViaDummyDevice()
 {
@@ -1241,15 +966,6 @@ static bool HookViaDummyDevice()
         return false;
     }
 
-    /*
-    VkInstance inst = VK_NULL_HANDLE;
-    VkResult r = fnCreateInstance(&ici, nullptr, &inst);
-    if (r != VK_SUCCESS || !inst)
-    {
-        Log("dummy: vkCreateInstance failed (%d)", (int)r);
-        return false;
-    }
-    */
 
     auto fnEnumPhys = (PFN_vkEnumeratePhysicalDevices)
         fnGetInstanceProcAddr(inst, "vkEnumeratePhysicalDevices");
@@ -1290,6 +1006,7 @@ static bool HookViaDummyDevice()
         { "vkCmdSetViewport",          (void*)DetourVkCmdSetViewport,          (void**)&pOriginalCmdSetViewport },
         { "vkCmdDrawIndexed",          (void*)DetourVkCmdDrawIndexed,          (void**)&pOriginalCmdDrawIndexed },
         { "vkCmdDrawIndexedIndirect",  (void*)DetourVkCmdDrawIndexedIndirect,  (void**)&pOriginalCmdDrawIndexedIndirect },
+        { "vkDestroyPipeline",         (void*)DetourVkDestroyPipeline,         (void**)&pOriginalDestroyPipeline },
         
     };
 
@@ -1375,6 +1092,8 @@ static bool HookViaDummyDevice()
     return anyPatched;
 }
 
+//===================================================================================================//
+
 DWORD WINAPI HookThread(LPVOID)
 {
     Log("Hook Thread Started");
@@ -1385,11 +1104,6 @@ DWORD WINAPI HookThread(LPVOID)
 
     if (MH_Initialize() != MH_OK)
         return 1;
-
-    // Optional: keep resolver hooks for games that resolve late?
-    //MH_CreateHook(GetProcAddress(hVulkan, "vkGetInstanceProcAddr"), DetourGetInstanceProcAddr, (LPVOID*)&pOriginalGetInstanceProcAddr);
-    //MH_CreateHook(GetProcAddress(hVulkan, "vkGetDeviceProcAddr"), DetourGetDeviceProcAddr, (LPVOID*)&pOriginalGetDeviceProcAddr);
-    //MH_EnableHook(MH_ALL_HOOKS);
 
     HookViaDummyDevice();
     return 0;
