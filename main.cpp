@@ -21,8 +21,9 @@
 // --- Globals ---
 int countnum = -1;
 bool reversedDepth = false;
-//stride value needs to be correctfor coloring to work
+//stride value needs to be correct for colors to work
 static constexpr uint32_t kHighlightStride = 28;   //40 = valheim, 48 = zombie army 4: dead war, 28 = deadlock
+static constexpr uint32_t kHighlightStride2 = 40;
 
 //Log
 inline void Log(const char* fmt, ...) {
@@ -46,6 +47,7 @@ typedef PFN_vkVoidFunction(VKAPI_PTR* PFN_vkGetInstanceProcAddr)(VkInstance inst
 typedef VkResult(VKAPI_PTR* PFN_vkCreateGraphicsPipelines)(VkDevice, VkPipelineCache, uint32_t, const VkGraphicsPipelineCreateInfo*, const VkAllocationCallbacks*, VkPipeline*);
 typedef void (VKAPI_PTR* PFN_vkCmdBindPipeline)(VkCommandBuffer, VkPipelineBindPoint, VkPipeline);
 typedef void (VKAPI_PTR* PFN_vkCmdSetViewport_Custom)(VkCommandBuffer, uint32_t, uint32_t, const VkViewport*);
+typedef void (VKAPI_PTR* PFN_CmdSetViewportWithCount)(VkCommandBuffer cmd, uint32_t count, const VkViewport* pVp);
 typedef void (VKAPI_PTR* PFN_vkCmdDraw)(VkCommandBuffer, uint32_t, uint32_t, uint32_t, uint32_t);
 typedef void (VKAPI_PTR* PFN_vkCmdDrawIndexed)(VkCommandBuffer, uint32_t, uint32_t, uint32_t, int32_t, uint32_t);
 typedef void (VKAPI_PTR* PFN_vkCmdDrawIndirect)(VkCommandBuffer, VkBuffer, VkDeviceSize, uint32_t, uint32_t);
@@ -67,6 +69,7 @@ PFN_vkGetInstanceProcAddr pOriginalGetInstanceProcAddr = nullptr;
 PFN_vkCreateGraphicsPipelines pOriginalCreateGraphicsPipelines = nullptr;
 PFN_vkCmdBindPipeline         pOriginalCmdBindPipeline = nullptr;
 PFN_vkCmdSetViewport_Custom pOriginalCmdSetViewport = nullptr;
+PFN_vkCmdSetViewportWithCount pOriginalCmdSetViewportWithCount = nullptr;
 PFN_vkCmdDraw pOriginalCmdDraw = nullptr;
 PFN_vkCmdDrawIndexed pOriginalCmdDrawIndexed = nullptr;
 PFN_vkCmdDrawIndirect pOriginalCmdDrawIndirect = nullptr;
@@ -175,18 +178,6 @@ static bool GetModuleHash(VkShaderModule m, uint64_t& out)
 
 //===================================================================================================//
 
-// ============================================================================
-// DetourVkCreateGraphicsPipelines  (VK_EXT_graphics_pipeline_library aware)
-//
-// Assumes you already have: pOriginalCreateGraphicsPipelines, g_mtx,
-// g_pipelineStrides, g_pipelineKey, g_highlightPipelines, kHighlightStride,
-// kVerboseKeyLog, GetModuleHash(), combine(), Log().
-//
-// Needs: <vector> <unordered_map> <atomic> <mutex>
-// ============================================================================
-
-// ---- add near your other globals ------------------------------------------
-
 struct LibInfo
 {
     VkGraphicsPipelineLibraryFlagsEXT parts = 0;   // which GPL parts this pipeline contains
@@ -265,7 +256,6 @@ static VkGraphicsPipelineCreateInfo BuildHighlightCI(const VkGraphicsPipelineCre
     return h;
 }
 
-// ---- the detour -------------------------------------------------------------
 
 VKAPI_ATTR VkResult VKAPI_CALL DetourVkCreateGraphicsPipelines(
     VkDevice device,
@@ -576,7 +566,7 @@ VKAPI_ATTR VkResult VKAPI_CALL DetourVkCreateGraphicsPipelines(
             ci.pColorBlendState->attachmentCount > 0 &&
             ci.pColorBlendState->pAttachments;
 
-        const bool strideWanted = (stride == kHighlightStride) || strideUnknown;
+        const bool strideWanted = (stride == kHighlightStride) || (stride == kHighlightStride2) || strideUnknown;
 
         if (!isLinked && colorBlendOk && (isLibrary || (hasFrag && strideWanted)))
         {
@@ -735,6 +725,26 @@ void VKAPI_CALL DetourVkCmdSetViewport(VkCommandBuffer cmd, uint32_t first, uint
 
 //===================================================================================================//
 
+void VKAPI_CALL DetourVkCmdSetViewportWithCount(VkCommandBuffer cmd, uint32_t count, const VkViewport* pVp)
+{
+    static bool loggedOnce = false;
+    if (!loggedOnce) {
+        Log("DetourVkCmdSetViewportWithCount");
+        loggedOnce = true;
+    }
+
+    if (pVp && count > 0) {
+        std::unique_lock<std::shared_mutex> lock(statesMtx);
+        CmdState& st = cmdStates[cmd];
+        st.currentViewport = pVp[0];
+        st.firstViewport = 0;
+        st.hasViewport = true;
+    }
+    pOriginalCmdSetViewportWithCount(cmd, count, pVp);
+}
+
+//===================================================================================================//
+
 void VKAPI_CALL DetourVkCmdSetVertexInputEXT(
     VkCommandBuffer                             commandBuffer,
     uint32_t                                    vertexBindingDescriptionCount,
@@ -819,18 +829,11 @@ void VKAPI_CALL DetourVkCmdDrawIndexed(VkCommandBuffer cmd, uint32_t idxCount, u
     }
     const uint32_t stride = dstride ? dstride : pstride; //model recognition option 1
     const uint32_t shortkey = static_cast<uint32_t>(key % 100); //model recognition option 2
-    //Log("1 dstride == %d && pstride == %d", dstride, pstride);
     
     //if (dstride == 0 && pstride == 0)
     //{
-        //Log(
-            //"DrawIndexed: cmd=%p original=%p highlight=%p key=%llu "
-            //"dstride=0 pstride=0 idxCount=%u",
-            //(void*)cmd,
-            //(void*)original,
-            //(void*)highlight,
-            //(unsigned long long)key,
-            //idxCount);
+        //Log("DrawIndexed: cmd=%p original=%p highlight=%p key=%llu ""dstride=0 pstride=0 idxCount=%u",
+            //(void*)cmd,(void*)original,(void*)highlight,(unsigned long long)key,idxCount);
     //}
     
 
@@ -847,7 +850,7 @@ void VKAPI_CALL DetourVkCmdDrawIndexed(VkCommandBuffer cmd, uint32_t idxCount, u
     }
 
 
-    //if (shortKey == countnum)
+    //if (shortkey == countnum)
     if (stride > 0 && stride == countnum) //stride 40 = models in valheim
     {
         //return;
@@ -950,7 +953,7 @@ void VKAPI_CALL DetourVkCmdDrawIndexedIndirect(VkCommandBuffer cmd, VkBuffer buf
     }
 
 
-    //if (shortKey == countnum)
+    //if (shortkey == countnum)
     if (stride > 0 && istride == countnum) //stride 40 = models in valheim
     {
         if (found && localState.hasViewport) {
@@ -1174,6 +1177,7 @@ static bool HookViaDummyDevice()
         { "vkCreateShaderModule",      (void*)DetourVkCreateShaderModule,      (void**)&pOriginalCreateShaderModule },
         { "vkCmdSetVertexInputEXT",    (void*)DetourVkCmdSetVertexInputEXT,    (void**)&pOriginalCmdSetVertexInputEXT },
         { "vkCmdSetViewport",          (void*)DetourVkCmdSetViewport,          (void**)&pOriginalCmdSetViewport },
+        { "vkCmdSetViewportWithCount", (void*)DetourVkCmdSetViewportWithCount, (void**)&pOriginalCmdSetViewportWithCount },
         { "vkCmdDrawIndexed",          (void*)DetourVkCmdDrawIndexed,          (void**)&pOriginalCmdDrawIndexed },
         { "vkCmdDrawIndexedIndirect",  (void*)DetourVkCmdDrawIndexedIndirect,  (void**)&pOriginalCmdDrawIndexedIndirect },
         { "vkDestroyPipeline",         (void*)DetourVkDestroyPipeline,         (void**)&pOriginalDestroyPipeline },
