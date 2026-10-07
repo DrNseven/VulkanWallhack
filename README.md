@@ -1,8 +1,6 @@
 # VulkanWallhack
 vulkan wallhack hook dll
 
-UNDER CONSTRUCTION, NOT FINISHED YET
-
 1. compile dll
 2. inject dll into an vulkan game, 
 you need to inject early to intercept functions!
