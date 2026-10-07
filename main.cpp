@@ -20,7 +20,7 @@
 
 // --- Globals ---
 int countnum = -1;
-bool reversedDepth = false;
+bool reversedDepth = true;
 
 //Log
 inline void Log(const char* fmt, ...) {
@@ -52,6 +52,12 @@ typedef void (VKAPI_PTR* PFN_vkCmdDrawIndirectCount)(VkCommandBuffer, VkBuffer, 
 typedef void (VKAPI_PTR* PFN_vkCmdDrawIndexedIndirectCount)(VkCommandBuffer, VkBuffer, VkDeviceSize, VkBuffer, VkDeviceSize, uint32_t, uint32_t);
 typedef void (VKAPI_PTR* PFN_vkCmdBindDescriptorSets)(VkCommandBuffer, VkPipelineBindPoint, VkPipelineLayout, uint32_t, uint32_t, const VkDescriptorSet*, uint32_t, const uint32_t*);
 typedef VkResult(VKAPI_PTR* PFN_vkCreateShaderModule)(VkDevice device,const VkShaderModuleCreateInfo* pCreateInfo,const VkAllocationCallbacks* pAllocator,VkShaderModule* pModule);
+typedef void (VKAPI_PTR* PFN_vkCmdSetVertexInputEXT)(
+    VkCommandBuffer                             commandBuffer,
+    uint32_t                                    vertexBindingDescriptionCount,
+    const VkVertexInputBindingDescription2EXT* pVertexBindingDescriptions,
+    uint32_t                                    vertexAttributeDescriptionCount,
+    const VkVertexInputAttributeDescription2EXT* pVertexAttributeDescriptions);
 
 // Typedefs
 PFN_vkGetDeviceProcAddr pOriginalGetDeviceProcAddr = nullptr;
@@ -67,6 +73,7 @@ PFN_vkCmdDrawIndirectCount pOriginalCmdDrawIndirectCount = nullptr;
 PFN_vkCmdDrawIndexedIndirectCount pOriginalCmdDrawIndexedIndirectCount = nullptr;
 PFN_vkCmdBindDescriptorSets pOriginalCmdBindDescriptorSets = nullptr;
 PFN_vkCreateShaderModule pOriginalCreateShaderModule = nullptr;
+PFN_vkCmdSetVertexInputEXT pOriginalCmdSetVertexInputEXT = nullptr;
 
 //===================================================================================================//
 
@@ -153,8 +160,8 @@ std::unordered_map<VkPipeline, VkPipeline> g_highlightPipelines;   // original â
 std::unordered_map<VkCommandBuffer, VkPipeline> g_curPipeline;   // currently bound graphics pipeline
 std::unordered_map<VkPipeline, uint32_t> g_pipelineStrides; // pipeline -> binding 0 stride
 
-
-static constexpr uint32_t kHighlightStride = 40;   // 
+//stride value needs to be correctfor coloring to work
+static constexpr uint32_t kHighlightStride = 48;   //40 = valheim, 48 = zombie army 4: dead war, 
 
 // Short lock, lookup only, no calls made while it is held
 static bool GetModuleHash(VkShaderModule m, uint64_t& out)
@@ -459,12 +466,12 @@ VKAPI_ATTR VkResult VKAPI_CALL DetourVkCreateGraphicsPipelines(
                 att.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
                 att.dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
                 att.alphaBlendOp = VK_BLEND_OP_ADD;
-                //att.colorWriteMask = (VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_A_BIT);
+                //att.colorWriteMask = (VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_A_BIT); //gay
             }
 
             VkPipelineColorBlendStateCreateInfo blendState = *ci.pColorBlendState;
             blendState.pAttachments = attachments.data();
-            blendState.blendConstants[0] = 55.0f;   // R
+            blendState.blendConstants[0] = 55.0f;   // R 1.0f would be correct but it's not bright enough and can turn black
             blendState.blendConstants[1] = 0.0f;   // G
             blendState.blendConstants[2] = 0.0f;   // B
             blendState.blendConstants[3] = 1.0f;   // A
@@ -560,25 +567,9 @@ void VKAPI_CALL DetourVkCmdBindPipeline(VkCommandBuffer cmd, VkPipelineBindPoint
     g_curKey[cmd] = key;
     g_curPipeline[cmd] = pipeline;
 
-    /*
-    pOriginalCmdBindPipeline(cmd, bindPoint, pipeline);
-
-    if (bindPoint == VK_PIPELINE_BIND_POINT_GRAPHICS && pipeline != VK_NULL_HANDLE)
-    {
-        std::lock_guard<std::mutex> lock(g_mtx);
-
-        // Store both the key AND the actual pipeline handle
-        auto it = g_pipelineKey.find(pipeline);
-        uint64_t key = (it != g_pipelineKey.end()) ? it->second : 0;
-
-        g_curKey[cmd] = key;
-        g_curPipeline[cmd] = pipeline;          // we need later
-
-        if (kVerboseKeyLog)
-            Log("Bind: cmd=%p pipeline=%p found=%d key=%llu",
-                (void*)cmd, (void*)pipeline, it != g_pipelineKey.end(), key);
-    }
-    */
+    if (kVerboseKeyLog)
+        Log("Bind: cmd=%p pipeline=%p found=%d key=%llu",
+            (void*)cmd, (void*)pipeline, it != g_pipelineKey.end(), key);
 }
 
 //===================================================================================================//
@@ -605,17 +596,6 @@ void VKAPI_CALL DetourVkCmdSetViewport(VkCommandBuffer cmd, uint32_t first, uint
 
 //===================================================================================================//
 
-// Typedef
-typedef void (VKAPI_PTR* PFN_vkCmdSetVertexInputEXT)(
-    VkCommandBuffer                             commandBuffer,
-    uint32_t                                    vertexBindingDescriptionCount,
-    const VkVertexInputBindingDescription2EXT* pVertexBindingDescriptions,
-    uint32_t                                    vertexAttributeDescriptionCount,
-    const VkVertexInputAttributeDescription2EXT* pVertexAttributeDescriptions);
-
-PFN_vkCmdSetVertexInputEXT pOriginalCmdSetVertexInputEXT = nullptr;
-
-// Detour
 void VKAPI_CALL DetourVkCmdSetVertexInputEXT(
     VkCommandBuffer                             commandBuffer,
     uint32_t                                    vertexBindingDescriptionCount,
@@ -670,7 +650,6 @@ void VKAPI_CALL DetourVkCmdDrawIndexed(VkCommandBuffer cmd, uint32_t idxCount, u
 
     uint32_t dstride = 0;
     uint32_t pstride = 0;
-
     {
         std::lock_guard<std::mutex> lock(g_mtx);
 
@@ -699,53 +678,10 @@ void VKAPI_CALL DetourVkCmdDrawIndexed(VkCommandBuffer cmd, uint32_t idxCount, u
                 pstride = pst->second;
         }
     }
+    const uint32_t stride = dstride ? dstride : pstride; //model recognition option 1
+    const uint32_t shortkey = static_cast<uint32_t>(key % 100); //model recognition option 2
+    //Log("dstride == %d && pstride == %d", dstride, pstride);
 
-    const uint32_t stride = dstride ? dstride : pstride;
-
-    // Make the decision completely outside the mutex.
-    const bool shouldHighlight =
-        original != VK_NULL_HANDLE &&
-        highlight != VK_NULL_HANDLE &&
-        stride == 40;
-
-    if (!shouldHighlight)
-    {
-        pOriginalCmdDrawIndexed(
-            cmd,
-            idxCount,
-            instCount,
-            firstIdx,
-            vtxOff,
-            firstInst);
-
-        return;
-    }
-
-    // ------------------------------------------------------------
-    // Highlight draw
-    // ------------------------------------------------------------
-
-    pOriginalCmdBindPipeline(
-        cmd,
-        VK_PIPELINE_BIND_POINT_GRAPHICS,
-        highlight);
-
-    pOriginalCmdDrawIndexed(
-        cmd,
-        idxCount,
-        instCount,
-        firstIdx,
-        vtxOff,
-        firstInst);
-
-    // ------------------------------------------------------------
-    // Restore application pipeline
-    // ------------------------------------------------------------
-
-    //pOriginalCmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,original);
-
-  
-  
 
     //viewport
     CmdState localState;
@@ -761,7 +697,7 @@ void VKAPI_CALL DetourVkCmdDrawIndexed(VkCommandBuffer cmd, uint32_t idxCount, u
 
 
     //if (shortKey == countnum)
-    if(stride > 0 && stride == countnum) //40 = valheim
+    if (stride > 0 && shortkey + stride == countnum) //stride 40 = models in valheim
     {
         if (found && localState.hasViewport) {
 
@@ -779,28 +715,22 @@ void VKAPI_CALL DetourVkCmdDrawIndexed(VkCommandBuffer cmd, uint32_t idxCount, u
             pOriginalCmdDrawIndexed(cmd, idxCount, instCount, firstIdx, vtxOff, firstInst);
 
             pOriginalCmdSetViewport(cmd, localState.firstViewport, 1, &originalVp);
-        }    
+        }
     }
 
 
-
-
-
-    /*
-    const bool swap = (stride == 40) && highPipe != VK_NULL_HANDLE;
-
-    if (swap)
+    // Color (pipeline method)
+    const bool shouldHighlight = original != VK_NULL_HANDLE && highlight != VK_NULL_HANDLE && shortkey+stride == countnum; //stride 40 = models in valheim
+    if (!shouldHighlight)
     {
-        pOriginalCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, highPipe);
-    //const float blendConstants[4] = { 1.0f, 1.0f, 1.0f, 1.0f }; // red
-    //vkCmdSetBlendConstants(cmd, blendConstants);
+        pOriginalCmdDrawIndexed(cmd,idxCount,instCount,firstIdx,vtxOff,firstInst);
+        return;
     }
-    //pOriginalCmdDrawIndexed(cmd, idxCount, instCount, firstIdx, vtxOff, firstInst);
-
-    //if (swap)
-      //  pOriginalCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
-    */
-   
+    // Highlight draw
+    pOriginalCmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,highlight);
+    pOriginalCmdDrawIndexed(cmd,idxCount,instCount,firstIdx,vtxOff,firstInst);
+    // Restores application pipeline (except don't because it will erase color)
+    //pOriginalCmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,original);
 
 
     pOriginalCmdDrawIndexed(cmd, idxCount, instCount, firstIdx, vtxOff, firstInst);
@@ -815,6 +745,94 @@ void VKAPI_CALL DetourVkCmdDrawIndexedIndirect(VkCommandBuffer cmd, VkBuffer buf
         Log("DetourVkCmdDrawIndexedIndirect");
         loggedOnce = true;
     }
+
+    uint64_t   key = 0;
+    VkPipeline original = VK_NULL_HANDLE;
+    VkPipeline highlight = VK_NULL_HANDLE;
+
+    uint32_t dstride = 0;
+    uint32_t pstride = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_mtx);
+
+        auto kit = g_curKey.find(cmd);
+        if (kit != g_curKey.end())
+            key = kit->second;
+
+        auto pit = g_curPipeline.find(cmd);
+        if (pit != g_curPipeline.end())
+        {
+            original = pit->second;
+
+            auto hit = g_highlightPipelines.find(original);
+            if (hit != g_highlightPipelines.end())
+                highlight = hit->second;
+        }
+
+        auto sit = g_cmdBufStride.find(cmd);
+        if (sit != g_cmdBufStride.end())
+            dstride = sit->second;
+
+        if (dstride == 0 && original != VK_NULL_HANDLE)
+        {
+            auto pst = g_pipelineStrides.find(original);
+            if (pst != g_pipelineStrides.end())
+                pstride = pst->second;
+        }
+    }
+    const uint32_t istride = dstride ? dstride : pstride; //model recognition option 1
+    const uint32_t shortkey = static_cast<uint32_t>(key % 100); //model recognition option 2
+    //Log("dstride == %d && pstride == %d", dstride, pstride);
+
+
+    //viewport
+    CmdState localState;
+    bool found = false;
+    {
+        std::shared_lock<std::shared_mutex> lock(statesMtx);
+        auto it = cmdStates.find(cmd);
+        if (it != cmdStates.end()) {
+            localState = it->second;
+            found = true;
+        }
+    }
+
+
+    //if (shortKey == countnum)
+    if (stride > 0 && shortkey + istride == countnum) //stride 40 = models in valheim
+    {
+        if (found && localState.hasViewport) {
+
+            // Apply hack
+            const VkViewport originalVp = localState.currentViewport;
+            VkViewport hVp = originalVp;
+
+            // Depth range adjustment
+            hVp.minDepth = reversedDepth ? 0.0f : 0.9f;
+            hVp.maxDepth = reversedDepth ? 0.1f : 1.0f;
+
+            pOriginalCmdSetViewport(cmd, localState.firstViewport, 1, &hVp);
+
+            // Draw the hacked version
+            pOriginalCmdDrawIndexedIndirect(cmd, buffer, offset, drawCount, stride);
+
+            pOriginalCmdSetViewport(cmd, localState.firstViewport, 1, &originalVp);
+        }
+    }
+
+
+    // Color (pipeline method)
+    const bool shouldHighlight = original != VK_NULL_HANDLE && highlight != VK_NULL_HANDLE && shortkey + istride == countnum; //stride 40 = models in valheim
+    if (!shouldHighlight)
+    {
+        pOriginalCmdDrawIndexedIndirect(cmd, buffer, offset, drawCount, stride);
+        return;
+    }
+    // Highlight draw
+    pOriginalCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, highlight);
+    pOriginalCmdDrawIndexedIndirect(cmd, buffer, offset, drawCount, stride);
+    // Restores application pipeline (except don't because it will erase color)
+    //pOriginalCmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,original);
     
     return pOriginalCmdDrawIndexedIndirect(cmd, buffer, offset, drawCount, stride);
 }
