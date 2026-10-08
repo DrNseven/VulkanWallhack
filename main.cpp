@@ -21,6 +21,8 @@
 // --- Globals ---
 int countnum = -1;
 bool reversedDepth = false;
+bool wallhack = 1;
+bool colorhack = 0;
 //stride value needs to be correct for colors to work
 static constexpr uint32_t kHighlightStride = 40;   //40 = valheim, 48 = zombie army 4: dead war(reversedDepth=true), 28 = deadlock
 
@@ -1685,8 +1687,15 @@ void VKAPI_CALL DetourVkCmdDrawIndexed(VkCommandBuffer cmd, uint32_t idxCount, u
         }
     }
 
-    const bool wantColor = (original != VK_NULL_HANDLE && highlight != VK_NULL_HANDLE);
-    const bool wantWall = hasVp;
+
+    bool wantColor = (original != VK_NULL_HANDLE && highlight != VK_NULL_HANDLE);
+    bool wantWall = hasVp;
+
+    if (wallhack == 0)
+        wantWall = false;
+
+    if (colorhack == 0)
+        wantColor = false;
 
     // ------------------------------------------------------------------
     // 1) Normal draw – keeps depth buffer correct for the rest of the frame
@@ -1885,6 +1894,39 @@ void VKAPI_CALL DetourVkDestroyPipeline(
         pOriginalDestroyPipeline(device, clone, pAllocator);
     }
 }
+ 
+/*
+//to do:
+// ============================================================================
+// Lifetime / cleanup detours
+// ============================================================================
+VkResult VKAPI_CALL DetourVkResetCommandBuffer(
+    VkCommandBuffer commandBuffer,
+    VkCommandBufferResetFlags flags)
+{
+    RemoveCmdState(commandBuffer);
+    return pOriginalResetCommandBuffer
+        ? pOriginalResetCommandBuffer(commandBuffer, flags)
+        : VK_SUCCESS;
+}
+
+void VKAPI_CALL DetourVkFreeCommandBuffers(
+    VkDevice device,
+    VkCommandPool commandPool,
+    uint32_t commandBufferCount,
+    const VkCommandBuffer* pCommandBuffers)
+{
+    if (pCommandBuffers)
+    {
+        for (uint32_t i = 0; i < commandBufferCount; ++i)
+            RemoveCmdState(pCommandBuffers[i]);
+    }
+
+    if (pOriginalFreeCommandBuffers)
+        pOriginalFreeCommandBuffers(device, commandPool,
+            commandBufferCount, pCommandBuffers);
+}
+*/
 
 //===================================================================================================//
 
@@ -2099,11 +2141,20 @@ DWORD WINAPI HookThread(LPVOID)
 }
 
 DWORD WINAPI InputThread(LPVOID lpParam) {
+    bool p1 = false, p2 = false, p3 = false;
     while (true) {
         if (GetAsyncKeyState(VK_OEM_COMMA) & 1) { countnum--; }
         if (GetAsyncKeyState(VK_OEM_PERIOD) & 1) { countnum++; }
         if (GetAsyncKeyState(VK_OEM_MINUS) & 1) { countnum = -1; }
-        Sleep(1);
+
+        bool c1 = GetAsyncKeyState(VK_F1) & 0x8000;
+        bool c2 = GetAsyncKeyState(VK_F3) & 0x8000;
+
+        if (c1 && !p1) wallhack ^= 1;
+        if (c2 && !p2) colorhack ^= 1;
+
+        p1 = c1; p2 = c2;
+        Sleep(2);
     }
     return 0;
 }
