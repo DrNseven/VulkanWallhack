@@ -1,4 +1,7 @@
 ﻿// Vulkan Hook/Wallhack
+// Bruteforce stride (By pressing the keys: . and ,)
+// Toggle wallhack = F1
+// Toggle color = F3
 #define NOMINMAX
 #include <Windows.h>
 #include <iostream>
@@ -20,10 +23,8 @@
 
 // --- Globals ---
 int countnum = -1;
-bool reversedDepth = false;
 std::atomic<bool> wallhack{ false };
 std::atomic<bool> colorhack{ false };
-//stride value needs to be correct for colors to work
 static constexpr uint32_t kHighlightStride = 40;   //40 = valheim, 48 = zombie army 4: dead war(reversedDepth=true), 28 = deadlock
 
 //Log
@@ -187,7 +188,6 @@ static bool GetModuleHash(VkShaderModule m, uint64_t& out)
     return true;
 }
 
-
 // ---- flat red fragment shader (SPIR-V 1.0, 70 words) ------------------------
 // flat-red fragment shader
 static const uint32_t kRedFragSpv[] = {
@@ -204,7 +204,7 @@ static const uint32_t kRedFragSpv[] = {
     0x00000001, 0x00000000, 0x00000004, 0x000200f8, 0x0000000b, 0x0003003e,
     0x00000002, 0x0000000a, 0x000100fd, 0x00010038,
 };
-
+/*
 // magenta: o = vec4(1.0, 0.0, 1.0, 1.0)
 static const uint32_t kMagentaFragSpv[] = {
     0x07230203, 0x00010000, 0x00000000, 0x0000000c, 0x00000000, 0x00020011,
@@ -236,7 +236,7 @@ static const uint32_t kGreenFragSpv[] = {
     0x00000001, 0x00000000, 0x00000004, 0x000200f8, 0x0000000b, 0x0003003e,
     0x00000002, 0x0000000a, 0x000100fd, 0x00010038,
 };
-
+*/
 // One module per device, created lazily, intentionally never destroyed.
 static std::mutex                  g_redFragMtx;
 static std::unordered_map<VkDevice, VkShaderModule> g_redFragMods;
@@ -288,7 +288,6 @@ static VkShaderModule GetRedFragModule(VkDevice device)
 }
 
 // ---- shared bookkeeping ------------------------------------------------------
-
 struct LibInfo
 {
     VkGraphicsPipelineLibraryFlagsEXT parts = 0;       // GPL parts this pipeline contains
@@ -306,14 +305,10 @@ struct LibInfo
 
 std::unordered_map<VkPipeline, LibInfo> g_libInfo;     // guarded by g_mtx
 
-static constexpr VkGraphicsPipelineLibraryFlagsEXT kGplVI =
-VK_GRAPHICS_PIPELINE_LIBRARY_VERTEX_INPUT_INTERFACE_BIT_EXT;
-static constexpr VkGraphicsPipelineLibraryFlagsEXT kGplPre =
-VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT;
-static constexpr VkGraphicsPipelineLibraryFlagsEXT kGplFS =
-VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT;
-static constexpr VkGraphicsPipelineLibraryFlagsEXT kGplFO =
-VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_OUTPUT_INTERFACE_BIT_EXT;
+static constexpr VkGraphicsPipelineLibraryFlagsEXT kGplVI = VK_GRAPHICS_PIPELINE_LIBRARY_VERTEX_INPUT_INTERFACE_BIT_EXT;
+static constexpr VkGraphicsPipelineLibraryFlagsEXT kGplPre = VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT;
+static constexpr VkGraphicsPipelineLibraryFlagsEXT kGplFS = VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT;
+static constexpr VkGraphicsPipelineLibraryFlagsEXT kGplFO = VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_OUTPUT_INTERFACE_BIT_EXT;
 static constexpr VkGraphicsPipelineLibraryFlagsEXT kGplAll = kGplVI | kGplPre | kGplFS | kGplFO;
 
 // Owns the memory a highlight create-info points into. Must outlive the create call.
@@ -364,41 +359,6 @@ static VkGraphicsPipelineLibraryFlagsEXT BuildHighlightCI(
             out.pStages = hs.stages.data();
     }
 
-    /*
-    //VK_COMPARE_OP_ALWAYS wallhack works, good for fps, but does not punch though all walls 
-    // ---- depth/stencil: make the highlight a true wallhack overlay ----
-    if ((owned & kGplFS) && ci.pDepthStencilState)
-    {
-        hs.depth = *ci.pDepthStencilState;
-
-        // Force always-pass + no depth write 
-        hs.depth.depthTestEnable = VK_TRUE;               // keep test enabled so the op is used
-        hs.depth.depthCompareOp = VK_COMPARE_OP_ALWAYS;  //
-        hs.depth.depthWriteEnable = VK_FALSE;
-
-        // Never touch stencil
-        hs.depth.front.failOp = hs.depth.front.passOp = hs.depth.front.depthFailOp = VK_STENCIL_OP_KEEP;
-        hs.depth.back.failOp = hs.depth.back.passOp = hs.depth.back.depthFailOp = VK_STENCIL_OP_KEEP;
-        hs.depth.front.writeMask = 0;
-        hs.depth.back.writeMask = 0;
-
-        out.pDepthStencilState = &hs.depth;
-    }
-    */
-
-    /*
-    if ((owned & kGplFS) && ci.pDepthStencilState)
-    {
-        hs.depth = *ci.pDepthStencilState;
-
-        hs.depth.depthTestEnable = VK_FALSE;
-        hs.depth.depthWriteEnable = VK_FALSE;
-        hs.depth.stencilTestEnable = VK_FALSE;
-
-        out.pDepthStencilState = &hs.depth;
-    }
-    */
-
     // ---- depth/stencil: the highlight is an OVERLAY drawn after the game's own draw ----
     // The original draw already wrote depth, so the overlay must pass on equal depth,
     // and must not write depth or stencil. 
@@ -434,7 +394,42 @@ static VkGraphicsPipelineLibraryFlagsEXT BuildHighlightCI(
         hs.depth.back.writeMask = 0;
         out.pDepthStencilState = &hs.depth;
     }
-    
+
+    /*
+   //VK_COMPARE_OP_ALWAYS wallhack works, good for fps, but does not punch though all walls
+   // ---- depth/stencil: make the highlight a true wallhack overlay ----
+   if ((owned & kGplFS) && ci.pDepthStencilState)
+   {
+       hs.depth = *ci.pDepthStencilState;
+
+       // Force always-pass + no depth write
+       hs.depth.depthTestEnable = VK_TRUE;               // keep test enabled so the op is used
+       hs.depth.depthCompareOp = VK_COMPARE_OP_ALWAYS;  //
+       hs.depth.depthWriteEnable = VK_FALSE;
+
+       // Never touch stencil
+       hs.depth.front.failOp = hs.depth.front.passOp = hs.depth.front.depthFailOp = VK_STENCIL_OP_KEEP;
+       hs.depth.back.failOp = hs.depth.back.passOp = hs.depth.back.depthFailOp = VK_STENCIL_OP_KEEP;
+       hs.depth.front.writeMask = 0;
+       hs.depth.back.writeMask = 0;
+
+       out.pDepthStencilState = &hs.depth;
+   }
+   */
+
+   /*
+   //same effect as above
+   if ((owned & kGplFS) && ci.pDepthStencilState)
+   {
+       hs.depth = *ci.pDepthStencilState;
+
+       hs.depth.depthTestEnable = VK_FALSE;
+       hs.depth.depthWriteEnable = VK_FALSE;
+       hs.depth.stencilTestEnable = VK_FALSE;
+
+       out.pDepthStencilState = &hs.depth;
+   }
+   */   
 
     // ---- fragment output: overlay writes RGB of RT0 only ----
     // Every other attachment (normals, motion vectors, masks, ...) and the alpha
@@ -463,7 +458,6 @@ static VkGraphicsPipelineLibraryFlagsEXT BuildHighlightCI(
 }
 
 // ---- the detour -------------------------------------------------------------
-
 VKAPI_ATTR VkResult VKAPI_CALL DetourVkCreateGraphicsPipelines(
     VkDevice device,
     VkPipelineCache cache,
@@ -476,7 +470,7 @@ VKAPI_ATTR VkResult VKAPI_CALL DetourVkCreateGraphicsPipelines(
     if (!s_loggedOnce.exchange(true))
         Log("DetourVkCreateGraphicsPipelines");
 
-    // 1) Create the original pipelines first
+    // Create the original pipelines first
     VkResult r = pOriginalCreateGraphicsPipelines(device, cache, count, pCreateInfos, pAllocator, pPipelines);
 
     // Partial results (e.g. VK_PIPELINE_COMPILE_REQUIRED) still leave valid handles.
@@ -547,8 +541,8 @@ VKAPI_ATTR VkResult VKAPI_CALL DetourVkCreateGraphicsPipelines(
         const bool isLinked = li && li->libraryCount > 0 && li->pLibraries;
 
         // ------------------------------------------------------------
-        // Merge info from linked libraries (stride, key, parts, frag stage)
-        // and build the list with each library swapped for its highlight twin.
+        // Info from linked libraries (stride, key, parts, frag stage)
+        // and build the list with each library swapped for its highlight twin
         // ------------------------------------------------------------
         VkGraphicsPipelineLibraryFlagsEXT libParts = 0;
         VkGraphicsPipelineLibraryFlagsEXT swappedParts = 0;   // FS/FO parts the twins really changed
@@ -755,8 +749,7 @@ VKAPI_ATTR VkResult VKAPI_CALL DetourVkCreateGraphicsPipelines(
             }
         }
 
-        // Linked pipelines: fold in the libraries' keys (a linked final has no
-        // stages / vertex input of its own, so without this all finals collide).
+        // Linked pipelines: fold in the libraries' keys (a linked final has no stages / vertex input of its own, so without this all finals collide).
         if (isLinked)
             key = combine(key, libKey);
 
@@ -809,7 +802,6 @@ VKAPI_ATTR VkResult VKAPI_CALL DetourVkCreateGraphicsPipelines(
         bool       attempted = false;
         VkGraphicsPipelineLibraryFlagsEXT twinParts = 0;
         //Log("1");
-        //Log("stride == %d", stride);
         //const bool strideWanted = true;
         //const bool strideWanted = (stride == kHighlightStride) || strideUnknown;
         const bool strideWanted = (stride >= 1) || strideUnknown;
@@ -1600,7 +1592,6 @@ void VKAPI_CALL DetourVkCmdSetViewport(VkCommandBuffer cmd, uint32_t first, uint
     if (pVp && count > 0 && cmd)
     {
         std::unique_lock<std::shared_mutex> lock(statesMtx);
-        //std::unique_lock lock(statesMtx);
         CmdState& state = cmdStates[cmd];
         state.currentViewport = pVp[0];   // we only care about the first
         state.firstViewport = first;
@@ -1624,7 +1615,6 @@ void VKAPI_CALL DetourVkCmdSetViewportWithCount(VkCommandBuffer cmd, uint32_t co
     if (pVp && count > 0 && cmd)
     {
         std::unique_lock<std::shared_mutex> lock(statesMtx);
-        //std::unique_lock lock(statesMtx);
         CmdState& st = cmdStates[cmd];
         st.currentViewport = pVp[0];   // we only care about the first
         st.firstViewport = 0;
@@ -1669,47 +1659,6 @@ void VKAPI_CALL DetourVkCmdSetVertexInputEXT(
     pOriginalCmdSetVertexInputEXT(cmd, bindingCount, pBindings, attrCount, pAttrs);
 }
 
-/*
-void VKAPI_CALL DetourVkCmdSetVertexInputEXT(
-    VkCommandBuffer                             commandBuffer,
-    uint32_t                                    vertexBindingDescriptionCount,
-    const VkVertexInputBindingDescription2EXT* pVertexBindingDescriptions,
-    uint32_t                                    vertexAttributeDescriptionCount,
-    const VkVertexInputAttributeDescription2EXT* pVertexAttributeDescriptions)
-{
-    static bool loggedOnce = false;
-    if (!loggedOnce) {
-        Log("DetourVkCmdSetVertexInputEXT");
-        loggedOnce = true;
-    }
-    
-    // capture
-    if (pVertexBindingDescriptions && vertexBindingDescriptionCount > 0)
-    {
-        std::lock_guard<std::mutex> lock(g_mtx);
-
-        // simplest: just keep binding 0 stride
-        g_cmdBufStride[commandBuffer] = pVertexBindingDescriptions[0].stride;
-
-        // richer version 
-        VertexInputState& state = g_cmdBufVertexInput[commandBuffer];
-        state.bindingCount = vertexBindingDescriptionCount;
-        state.bindings.assign(pVertexBindingDescriptions,
-            pVertexBindingDescriptions + vertexBindingDescriptionCount);
-        state.attributeCount = vertexAttributeDescriptionCount;
-        state.attributes.assign(pVertexAttributeDescriptions,
-            pVertexAttributeDescriptions + vertexAttributeDescriptionCount);
-    }
-
-    pOriginalCmdSetVertexInputEXT(
-        commandBuffer,
-        vertexBindingDescriptionCount,
-        pVertexBindingDescriptions,
-        vertexAttributeDescriptionCount,
-        pVertexAttributeDescriptions);
-}
-*/
-
 //===================================================================================================//
 
 //Viewport wallhack punches through all walls, but worse for fps
@@ -1751,14 +1700,15 @@ void VKAPI_CALL DetourVkCmdDrawIndexed(VkCommandBuffer cmd, uint32_t idxCount, u
     const uint32_t stride = dstride ? dstride : pstride; //model recognition option 1
     const uint32_t shortkey = static_cast<uint32_t>(key % 100); //model recognition option 2
 
-    //bruteforce stride
+
+    // Bruteforce stride (By pressing the keys: . and ,)
     if (stride == countnum)
     return;
         //Log("shortkey == %d && stride == %d", shortkey, stride);
 
 
-    //model recognition
-    if (stride != kHighlightStride) //40 = valheim, 48 = zombie army 4: dead war(reversedDepth=true), 28 = deadlock
+    // Model recognition
+    if (stride != kHighlightStride) //40 = valheim, 48 = zombie army 4: dead war(reversedDepth=true), 28,56? = deadlock
     {
         if (pOriginalCmdDrawIndexed)
             pOriginalCmdDrawIndexed(cmd, idxCount, instCount, firstIdx, vtxOff, firstInst);
@@ -1800,17 +1750,17 @@ void VKAPI_CALL DetourVkCmdDrawIndexed(VkCommandBuffer cmd, uint32_t idxCount, u
         if (wantWall && pOriginalCmdSetViewport)
         {
             VkViewport hVp = localState.currentViewport;
-            //constexpr bool reversedDepth = false;   // set true if game uses reversed-Z
+            constexpr bool reversedDepth = false;   // set true if game uses reversed-Z (zombie army 4)
             hVp.minDepth = reversedDepth ? 0.0f : 0.9f;
             hVp.maxDepth = reversedDepth ? 0.1f : 1.0f;
             pOriginalCmdSetViewport(cmd, localState.firstViewport, 1, &hVp);
         }
 
-        // 2) Solid wallhack pass (model visible through every texture)
+        // 2) Solid wallhack pass
         if (wantWall && pOriginalCmdDrawIndexed)
             pOriginalCmdDrawIndexed(cmd, idxCount, instCount, firstIdx, vtxOff, firstInst);
 
-        // 3) Colour pass (drawn last → always visible, also through walls)
+        // 3) Colour pass 
         if (wantColor)
         {
             if (pOriginalCmdBindPipeline)
@@ -1831,66 +1781,6 @@ void VKAPI_CALL DetourVkCmdDrawIndexed(VkCommandBuffer cmd, uint32_t idxCount, u
 
 //===================================================================================================//
 
-/*
-//VK_COMPARE_OP_ALWAYS wallhack works, good for fps, but does not punch though all walls 
-//If you want to use this you must go to BuildHighlightCI and enable the VK_COMPARE_OP_ALWAYS part
-void VKAPI_CALL DetourVkCmdDrawIndexed(VkCommandBuffer cmd, uint32_t idxCount, uint32_t instCount,
-    uint32_t firstIdx, int32_t vtxOff, uint32_t firstInst)
-{
-    VkPipeline original = VK_NULL_HANDLE;
-    VkPipeline highlight = VK_NULL_HANDLE;
-    uint32_t   dstride = 0;
-    uint32_t   pstride = 0;
-
-    {
-        std::lock_guard<std::mutex> lock(g_mtx);
-        auto pit = g_curPipeline.find(cmd);
-        if (pit != g_curPipeline.end())
-        {
-            original = pit->second;
-            auto hit = g_highlightPipelines.find(original);
-            if (hit != g_highlightPipelines.end())
-                highlight = hit->second;
-            auto pst = g_pipelineStrides.find(original);
-            if (pst != g_pipelineStrides.end())
-                pstride = pst->second;
-        }
-        auto sit = g_cmdBufStride.find(cmd);
-        if (sit != g_cmdBufStride.end())
-            dstride = sit->second;
-    }
-
-    const uint32_t stride = dstride ? dstride : pstride;
-
-    // Only care about the models we want
-    if (stride != 40)
-    {
-        if (pOriginalCmdDrawIndexed)
-            pOriginalCmdDrawIndexed(cmd, idxCount, instCount, firstIdx, vtxOff, firstInst);
-        return;
-    }
-
-    // 1) Game’s own draw (writes correct depth, normals, etc.)
-    if (pOriginalCmdDrawIndexed)
-        pOriginalCmdDrawIndexed(cmd, idxCount, instCount, firstIdx, vtxOff, firstInst);
-
-    // 2) Coloured wallhack overlay (ALWAYS depth test → through all walls)
-    if (original != VK_NULL_HANDLE && highlight != VK_NULL_HANDLE)
-    {
-        if (pOriginalCmdBindPipeline)
-            pOriginalCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, highlight);
-
-        if (pOriginalCmdDrawIndexed)
-            pOriginalCmdDrawIndexed(cmd, idxCount, instCount, firstIdx, vtxOff, firstInst);
-
-        if (pOriginalCmdBindPipeline)
-            pOriginalCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, original);
-    }
-}
-*/
-
-//===================================================================================================//
-
 void VKAPI_CALL DetourVkCmdDrawIndexedIndirect(VkCommandBuffer cmd, VkBuffer buffer, VkDeviceSize offset, uint32_t drawCount, uint32_t stride)
 {
     static bool loggedOnce = false;
@@ -1899,7 +1789,7 @@ void VKAPI_CALL DetourVkCmdDrawIndexedIndirect(VkCommandBuffer cmd, VkBuffer buf
         loggedOnce = true;
     }
  
-    //if game is drawing models here, paste code from DrawIndexed here and rename stride to istride
+    //if game is drawing models in this fuction, paste code from DrawIndexed here and rename stride to istride
 
     return pOriginalCmdDrawIndexedIndirect(cmd, buffer, offset, drawCount, stride);
 }
@@ -1982,12 +1872,10 @@ void VKAPI_CALL DetourVkDestroyPipeline(
         pOriginalDestroyPipeline(device, clone, pAllocator);
     }
 }
- 
 
-//to do:
-// ============================================================================
+//===================================================================================================
+
 // Lifetime / cleanup detours
-// ============================================================================
 void ClearCmdState(VkCommandBuffer cmd)
 {
     if (!cmd) return;
@@ -2004,9 +1892,7 @@ void ClearCmdState(VkCommandBuffer cmd)
     g_curPipeline.erase(cmd);
 }
 
-VkResult VKAPI_CALL DetourVkResetCommandBuffer(
-    VkCommandBuffer commandBuffer,
-    VkCommandBufferResetFlags flags)
+VkResult VKAPI_CALL DetourVkResetCommandBuffer(VkCommandBuffer commandBuffer,VkCommandBufferResetFlags flags)
 {
     ClearCmdState(commandBuffer);
     return pOriginalResetCommandBuffer
@@ -2041,8 +1927,6 @@ static bool HookViaDummyDevice()
         return false;
     }
 
-    // Loader functions, resolved from the exports (these are NOT hooked by us,
-    // except the two resolvers, which we avoid by using the saved originals).
     auto fnGetInstanceProcAddr = pOriginalGetInstanceProcAddr
         ? pOriginalGetInstanceProcAddr
         : (PFN_vkGetInstanceProcAddr)GetProcAddress(hVk, "vkGetInstanceProcAddr");
@@ -2063,7 +1947,6 @@ static bool HookViaDummyDevice()
 
     VkInstanceCreateInfo ici{ VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO };
     ici.pApplicationInfo = &app;
-
 
 
     Sleep(250);   // let the loader finish its first-time init
@@ -2253,7 +2136,7 @@ DWORD WINAPI InputThread(LPVOID lpParam) {
         bool c1 = GetAsyncKeyState(VK_F1) & 0x8000;
         bool c2 = GetAsyncKeyState(VK_F3) & 0x8000;
 
-        if (c1 && !p1) wallhack = !wallhack;   // or wallhack.store(!wallhack.load());
+        if (c1 && !p1) wallhack = !wallhack;   
         if (c2 && !p2) colorhack = !colorhack;
 
         p1 = c1; p2 = c2;
