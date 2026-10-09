@@ -8,7 +8,8 @@ you need to inject early to intercept functions!
 
 The default stride is 40 it is the model recognition for valheim 
 
-Toggle wallhack = F1
-Toggle color = F3
+Toggle wallhack = F3
+Toggle color = F4
+Toggle logging = F5
 
 ![alt tag](https://github.com/DrNseven/VulkanWallhack/blob/main/vwallhack.jpg)
