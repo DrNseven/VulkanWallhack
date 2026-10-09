@@ -21,10 +21,10 @@
 // --- Globals ---
 int countnum = -1;
 bool reversedDepth = false;
-bool wallhack = 1;
+bool wallhack = 0;
 bool colorhack = 0;
 //stride value needs to be correct for colors to work
-static constexpr uint32_t kHighlightStride = 40;   //40 = valheim, 48 = zombie army 4: dead war(reversedDepth=true), 28 = deadlock
+static constexpr uint32_t kHighlightStride = 28;   //40 = valheim, 48 = zombie army 4: dead war(reversedDepth=true), 28 = deadlock
 
 //Log
 inline void Log(const char* fmt, ...) {
@@ -784,7 +784,7 @@ VKAPI_ATTR VkResult VKAPI_CALL DetourVkCreateGraphicsPipelines(
         bool       attempted = false;
         VkGraphicsPipelineLibraryFlagsEXT twinParts = 0;
 
-        const bool strideWanted = (stride == kHighlightStride) || strideUnknown;
+        const bool strideWanted = (stride >= 1) || strideUnknown;
 
         if (!isLinked && (!ownsFS || realDepthTest) &&
             (isLibrary ? (ownsFS || ownsFO) : (hasFrag && strideWanted)))
@@ -1635,7 +1635,7 @@ void VKAPI_CALL DetourVkCmdDrawIndexed(VkCommandBuffer cmd, uint32_t idxCount, u
         Log("DetourVkCmdDrawIndexed");
         loggedOnce = true;
     }
-
+    
     VkPipeline original = VK_NULL_HANDLE;
     VkPipeline highlight = VK_NULL_HANDLE;
     uint32_t   dstride = 0;
@@ -1664,6 +1664,11 @@ void VKAPI_CALL DetourVkCmdDrawIndexed(VkCommandBuffer cmd, uint32_t idxCount, u
     }
     const uint32_t stride = dstride ? dstride : pstride; //model recognition option 1
     const uint32_t shortkey = static_cast<uint32_t>(key % 100); //model recognition option 2
+
+    //bruteforce stride
+    //if (stride == countnum)
+    //return;
+        //Log("shortkey == %d && stride == %d", shortkey, stride);
 
 
     //model recognition
@@ -1712,7 +1717,7 @@ void VKAPI_CALL DetourVkCmdDrawIndexed(VkCommandBuffer cmd, uint32_t idxCount, u
         if (wantWall && pOriginalCmdSetViewport)
         {
             VkViewport hVp = localState.currentViewport;
-            constexpr bool reversedDepth = false;   // set true if game uses reversed-Z
+            //constexpr bool reversedDepth = false;   // set true if game uses reversed-Z
             hVp.minDepth = reversedDepth ? 0.0f : 0.9f;
             hVp.maxDepth = reversedDepth ? 0.1f : 1.0f;
             pOriginalCmdSetViewport(cmd, localState.firstViewport, 1, &hVp);
@@ -1811,8 +1816,117 @@ void VKAPI_CALL DetourVkCmdDrawIndexedIndirect(VkCommandBuffer cmd, VkBuffer buf
         loggedOnce = true;
     }
 
+    /*
     //if game is drawing models here, paste code from DrawIndexed here and rename stride to istride
 
+    VkPipeline original = VK_NULL_HANDLE;
+    VkPipeline highlight = VK_NULL_HANDLE;
+    uint32_t   dstride = 0;
+    uint32_t   pstride = 0;
+    uint64_t   key = 0;
+
+    {
+        std::lock_guard<std::mutex> lock(g_mtx);
+        auto pit = g_curPipeline.find(cmd);
+        if (pit != g_curPipeline.end())
+        {
+            original = pit->second;
+            auto hit = g_highlightPipelines.find(original);
+            if (hit != g_highlightPipelines.end())
+                highlight = hit->second;
+            auto pst = g_pipelineStrides.find(original);
+            if (pst != g_pipelineStrides.end())
+                pstride = pst->second;
+        }
+        auto sit = g_cmdBufStride.find(cmd);
+        if (sit != g_cmdBufStride.end())
+            dstride = sit->second;
+        auto kit = g_curKey.find(cmd);
+        if (kit != g_curKey.end())
+            key = kit->second;
+    }
+    const uint32_t istride = dstride ? dstride : pstride; //model recognition option 1
+    const uint32_t shortkey = static_cast<uint32_t>(key % 100); //model recognition option 2
+
+    //bruteforce stride
+    if (stride == countnum)
+        return;
+
+
+    //model recognition
+    if (stride != kHighlightStride) //40 = valheim, 48 = zombie army 4: dead war(reversedDepth=true), 28 = deadlock
+    {
+        if (pOriginalCmdDrawIndexed)
+            pOriginalCmdDrawIndexedIndirect(cmd, buffer, offset, drawCount, stride);
+        return;
+    }
+
+    // Capture viewport
+    bool hasVp = false;
+    CmdState localState{};
+    {
+        std::shared_lock<std::shared_mutex> lock(statesMtx);
+        auto it = cmdStates.find(cmd);
+        if (it != cmdStates.end() && it->second.hasViewport)
+        {
+            localState = it->second;
+            hasVp = true;
+        }
+    }
+
+
+    bool wantColor = (original != VK_NULL_HANDLE && highlight != VK_NULL_HANDLE);
+    bool wantWall = hasVp;
+
+    if (wallhack == 0)
+        wantWall = false;
+
+    if (colorhack == 0)
+        wantColor = false;
+
+    // ------------------------------------------------------------------
+    // 1) Normal draw – keeps depth buffer correct for the rest of the frame
+    // ------------------------------------------------------------------
+    if (pOriginalCmdDrawIndexed)
+        pOriginalCmdDrawIndexedIndirect(cmd, buffer, offset, drawCount, stride);
+
+    // ------------------------------------------------------------------
+    // 2) + 3) Wallhack solid + Colour  (both use modified viewport)
+    // ------------------------------------------------------------------
+    if (wantWall || wantColor)
+    {
+        // Apply wallhack viewport once for the remaining passes
+        if (wantWall && pOriginalCmdSetViewport)
+        {
+            VkViewport hVp = localState.currentViewport;
+            constexpr bool reversedDepth = false;   // set true if game uses reversed-Z
+            hVp.minDepth = reversedDepth ? 0.0f : 0.9f;
+            hVp.maxDepth = reversedDepth ? 0.1f : 1.0f;
+            pOriginalCmdSetViewport(cmd, localState.firstViewport, 1, &hVp);
+        }
+
+        // 2) Solid wallhack pass (model visible through every texture)
+        if (wantWall && pOriginalCmdDrawIndexed)
+            pOriginalCmdDrawIndexedIndirect(cmd, buffer, offset, drawCount, stride);
+
+        // 3) Colour pass (drawn last → always visible, also through walls)
+        if (wantColor)
+        {
+            if (pOriginalCmdBindPipeline)
+                pOriginalCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, highlight);
+
+            if (pOriginalCmdDrawIndexed)
+                pOriginalCmdDrawIndexedIndirect(cmd, buffer, offset, drawCount, stride);
+
+            if (pOriginalCmdBindPipeline)
+                pOriginalCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, original);
+        }
+
+        // Restore original viewport
+        if (wantWall && pOriginalCmdSetViewport)
+            pOriginalCmdSetViewport(cmd, localState.firstViewport, 1, &localState.currentViewport);
+    }
+    */
     return pOriginalCmdDrawIndexedIndirect(cmd, buffer, offset, drawCount, stride);
 }
 
@@ -2141,7 +2255,7 @@ DWORD WINAPI HookThread(LPVOID)
 }
 
 DWORD WINAPI InputThread(LPVOID lpParam) {
-    bool p1 = false, p2 = false, p3 = false;
+    bool p1 = false, p2 = false;
     while (true) {
         if (GetAsyncKeyState(VK_OEM_COMMA) & 1) { countnum--; }
         if (GetAsyncKeyState(VK_OEM_PERIOD) & 1) { countnum++; }
