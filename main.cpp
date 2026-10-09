@@ -21,10 +21,10 @@
 // --- Globals ---
 int countnum = -1;
 bool reversedDepth = false;
-bool wallhack = 0;
-bool colorhack = 0;
+std::atomic<bool> wallhack{ false };
+std::atomic<bool> colorhack{ false };
 //stride value needs to be correct for colors to work
-static constexpr uint32_t kHighlightStride = 28;   //40 = valheim, 48 = zombie army 4: dead war(reversedDepth=true), 28 = deadlock
+static constexpr uint32_t kHighlightStride = 40;   //40 = valheim, 48 = zombie army 4: dead war(reversedDepth=true), 28 = deadlock
 
 //Log
 inline void Log(const char* fmt, ...) {
@@ -57,12 +57,11 @@ typedef void (VKAPI_PTR* PFN_vkCmdDrawIndirectCount)(VkCommandBuffer, VkBuffer, 
 typedef void (VKAPI_PTR* PFN_vkCmdDrawIndexedIndirectCount)(VkCommandBuffer, VkBuffer, VkDeviceSize, VkBuffer, VkDeviceSize, uint32_t, uint32_t);
 typedef void (VKAPI_PTR* PFN_vkCmdBindDescriptorSets)(VkCommandBuffer, VkPipelineBindPoint, VkPipelineLayout, uint32_t, uint32_t, const VkDescriptorSet*, uint32_t, const uint32_t*);
 typedef VkResult(VKAPI_PTR* PFN_vkCreateShaderModule)(VkDevice device,const VkShaderModuleCreateInfo* pCreateInfo,const VkAllocationCallbacks* pAllocator,VkShaderModule* pModule);
-typedef void (VKAPI_PTR* PFN_vkCmdSetVertexInputEXT)(
-    VkCommandBuffer                             commandBuffer,
-    uint32_t                                    vertexBindingDescriptionCount,
-    const VkVertexInputBindingDescription2EXT* pVertexBindingDescriptions,
-    uint32_t                                    vertexAttributeDescriptionCount,
-    const VkVertexInputAttributeDescription2EXT* pVertexAttributeDescriptions);
+typedef void (VKAPI_PTR* PFN_vkCmdSetVertexInputEXT)(VkCommandBuffer commandBuffer,uint32_t vertexBindingDescriptionCount,const VkVertexInputBindingDescription2EXT* pVertexBindingDescriptions,
+    uint32_t vertexAttributeDescriptionCount,const VkVertexInputAttributeDescription2EXT* pVertexAttributeDescriptions);
+typedef VkResult(VKAPI_PTR* PFN_vkResetCommandBuffer)(VkCommandBuffer, VkCommandBufferResetFlags);
+typedef void     (VKAPI_PTR* PFN_vkFreeCommandBuffers)(VkDevice, VkCommandPool, uint32_t, const VkCommandBuffer*);
+
 
 // Typedefs
 PFN_vkGetDeviceProcAddr pOriginalGetDeviceProcAddr = nullptr;
@@ -80,6 +79,8 @@ PFN_vkCmdDrawIndexedIndirectCount pOriginalCmdDrawIndexedIndirectCount = nullptr
 PFN_vkCmdBindDescriptorSets pOriginalCmdBindDescriptorSets = nullptr;
 PFN_vkCreateShaderModule pOriginalCreateShaderModule = nullptr;
 PFN_vkCmdSetVertexInputEXT pOriginalCmdSetVertexInputEXT = nullptr;
+PFN_vkResetCommandBuffer  pOriginalResetCommandBuffer = nullptr;
+PFN_vkFreeCommandBuffers  pOriginalFreeCommandBuffers = nullptr;
 
 //===================================================================================================//
 
@@ -784,7 +785,7 @@ VKAPI_ATTR VkResult VKAPI_CALL DetourVkCreateGraphicsPipelines(
         bool       attempted = false;
         VkGraphicsPipelineLibraryFlagsEXT twinParts = 0;
 
-        const bool strideWanted = (stride >= 1) || strideUnknown;
+        const bool strideWanted = (stride == kHighlightStride) || strideUnknown;
 
         if (!isLinked && (!ownsFS || realDepthTest) &&
             (isLibrary ? (ownsFS || ownsFO) : (hasFrag && strideWanted)))
@@ -808,6 +809,38 @@ VKAPI_ATTR VkResult VKAPI_CALL DetourVkCreateGraphicsPipelines(
                 hr = pOriginalCreateGraphicsPipelines(device, cache, 1, &hci, pAllocator, &highlightPipe);
             }
         }
+
+        else if (isLinked && swapped && !ownsFS && !ownsFO &&
+            (isLibrary || (hasFrag && strideWanted &&
+                (swappedParts & (kGplFS | kGplFO)) == (kGplFS | kGplFO))))
+        {
+            // Safe copy – never mutate the application's create-info
+            VkGraphicsPipelineCreateInfo hci = ci;
+            hci.flags &= ~(VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT |
+                VK_PIPELINE_CREATE_DERIVATIVE_BIT);
+            hci.basePipelineHandle = VK_NULL_HANDLE;
+            hci.basePipelineIndex = -1;
+
+            // Local copy of the library info
+            VkPipelineLibraryCreateInfoKHR localLib = *li;
+            localLib.pLibraries = hlLibs.data();          // our vector stays alive for the call
+
+            // Re-wire pNext so the local lib info is used
+            // (simple case – assumes li is directly in the pNext chain)
+            // For a more robust version you can rebuild the whole pNext chain,
+            // but this is enough for the common case.
+            hci.pNext = &localLib;
+
+            // If the original pNext contained more structures you care about,
+            // you would need to copy them too. For most games the library info
+            // is the only relevant one here.
+
+            attempted = true;
+            twinParts = swappedParts;
+            hr = pOriginalCreateGraphicsPipelines(device, cache, 1, &hci, pAllocator, &highlightPipe);
+        }
+        /*
+        //not ideal (but last working)
         else if (isLinked && swapped && !ownsFS && !ownsFO &&
             (isLibrary || (hasFrag && strideWanted &&
                 (swappedParts & (kGplFS | kGplFO)) == (kGplFS | kGplFO))))
@@ -831,6 +864,7 @@ VKAPI_ATTR VkResult VKAPI_CALL DetourVkCreateGraphicsPipelines(
 
             mli->pLibraries = savedLibs;
         }
+        */
 
         if (attempted)
         {
@@ -1588,6 +1622,39 @@ void VKAPI_CALL DetourVkCmdSetViewportWithCount(VkCommandBuffer cmd, uint32_t co
 //===================================================================================================//
 
 void VKAPI_CALL DetourVkCmdSetVertexInputEXT(
+    VkCommandBuffer cmd,
+    uint32_t bindingCount, const VkVertexInputBindingDescription2EXT* pBindings,
+    uint32_t attrCount, const VkVertexInputAttributeDescription2EXT* pAttrs)
+{
+    static std::atomic<bool> s_logged{ false };
+    if (!s_logged.exchange(true))
+        Log("DetourVkCmdSetVertexInputEXT");
+
+    if (pBindings && bindingCount > 0)
+    {
+        // build outside the lock
+        VertexInputState st;
+        st.bindingCount = bindingCount;
+        st.bindings.assign(pBindings, pBindings + bindingCount);
+        st.attributeCount = pAttrs ? attrCount : 0;
+        if (pAttrs && attrCount > 0)
+            st.attributes.assign(pAttrs, pAttrs + attrCount);
+
+        const uint32_t stride = pBindings[0].stride;
+
+        {
+            std::lock_guard<std::mutex> lock(g_mtx);     // only cheap writes under the lock
+            g_cmdBufStride[cmd] = stride;
+            g_cmdBufVertexInput[cmd] = std::move(st);
+        }
+    }
+
+    // never call into the driver while holding g_mtx
+    pOriginalCmdSetVertexInputEXT(cmd, bindingCount, pBindings, attrCount, pAttrs);
+}
+
+/*
+void VKAPI_CALL DetourVkCmdSetVertexInputEXT(
     VkCommandBuffer                             commandBuffer,
     uint32_t                                    vertexBindingDescriptionCount,
     const VkVertexInputBindingDescription2EXT* pVertexBindingDescriptions,
@@ -1603,6 +1670,8 @@ void VKAPI_CALL DetourVkCmdSetVertexInputEXT(
     // capture
     if (pVertexBindingDescriptions && vertexBindingDescriptionCount > 0)
     {
+        std::lock_guard<std::mutex> lock(g_mtx);
+
         // simplest: just keep binding 0 stride
         g_cmdBufStride[commandBuffer] = pVertexBindingDescriptions[0].stride;
 
@@ -1623,6 +1692,7 @@ void VKAPI_CALL DetourVkCmdSetVertexInputEXT(
         vertexAttributeDescriptionCount,
         pVertexAttributeDescriptions);
 }
+*/
 
 //===================================================================================================//
 
@@ -1696,11 +1766,8 @@ void VKAPI_CALL DetourVkCmdDrawIndexed(VkCommandBuffer cmd, uint32_t idxCount, u
     bool wantColor = (original != VK_NULL_HANDLE && highlight != VK_NULL_HANDLE);
     bool wantWall = hasVp;
 
-    if (wallhack == 0)
-        wantWall = false;
-
-    if (colorhack == 0)
-        wantColor = false;
+    if (!wallhack)  wantWall = false;
+    if (!colorhack) wantColor = false;
 
     // ------------------------------------------------------------------
     // 1) Normal draw – keeps depth buffer correct for the rest of the frame
@@ -1815,118 +1882,9 @@ void VKAPI_CALL DetourVkCmdDrawIndexedIndirect(VkCommandBuffer cmd, VkBuffer buf
         Log("DetourVkCmdDrawIndexedIndirect");
         loggedOnce = true;
     }
-
-    /*
+ 
     //if game is drawing models here, paste code from DrawIndexed here and rename stride to istride
 
-    VkPipeline original = VK_NULL_HANDLE;
-    VkPipeline highlight = VK_NULL_HANDLE;
-    uint32_t   dstride = 0;
-    uint32_t   pstride = 0;
-    uint64_t   key = 0;
-
-    {
-        std::lock_guard<std::mutex> lock(g_mtx);
-        auto pit = g_curPipeline.find(cmd);
-        if (pit != g_curPipeline.end())
-        {
-            original = pit->second;
-            auto hit = g_highlightPipelines.find(original);
-            if (hit != g_highlightPipelines.end())
-                highlight = hit->second;
-            auto pst = g_pipelineStrides.find(original);
-            if (pst != g_pipelineStrides.end())
-                pstride = pst->second;
-        }
-        auto sit = g_cmdBufStride.find(cmd);
-        if (sit != g_cmdBufStride.end())
-            dstride = sit->second;
-        auto kit = g_curKey.find(cmd);
-        if (kit != g_curKey.end())
-            key = kit->second;
-    }
-    const uint32_t istride = dstride ? dstride : pstride; //model recognition option 1
-    const uint32_t shortkey = static_cast<uint32_t>(key % 100); //model recognition option 2
-
-    //bruteforce stride
-    if (stride == countnum)
-        return;
-
-
-    //model recognition
-    if (stride != kHighlightStride) //40 = valheim, 48 = zombie army 4: dead war(reversedDepth=true), 28 = deadlock
-    {
-        if (pOriginalCmdDrawIndexed)
-            pOriginalCmdDrawIndexedIndirect(cmd, buffer, offset, drawCount, stride);
-        return;
-    }
-
-    // Capture viewport
-    bool hasVp = false;
-    CmdState localState{};
-    {
-        std::shared_lock<std::shared_mutex> lock(statesMtx);
-        auto it = cmdStates.find(cmd);
-        if (it != cmdStates.end() && it->second.hasViewport)
-        {
-            localState = it->second;
-            hasVp = true;
-        }
-    }
-
-
-    bool wantColor = (original != VK_NULL_HANDLE && highlight != VK_NULL_HANDLE);
-    bool wantWall = hasVp;
-
-    if (wallhack == 0)
-        wantWall = false;
-
-    if (colorhack == 0)
-        wantColor = false;
-
-    // ------------------------------------------------------------------
-    // 1) Normal draw – keeps depth buffer correct for the rest of the frame
-    // ------------------------------------------------------------------
-    if (pOriginalCmdDrawIndexed)
-        pOriginalCmdDrawIndexedIndirect(cmd, buffer, offset, drawCount, stride);
-
-    // ------------------------------------------------------------------
-    // 2) + 3) Wallhack solid + Colour  (both use modified viewport)
-    // ------------------------------------------------------------------
-    if (wantWall || wantColor)
-    {
-        // Apply wallhack viewport once for the remaining passes
-        if (wantWall && pOriginalCmdSetViewport)
-        {
-            VkViewport hVp = localState.currentViewport;
-            constexpr bool reversedDepth = false;   // set true if game uses reversed-Z
-            hVp.minDepth = reversedDepth ? 0.0f : 0.9f;
-            hVp.maxDepth = reversedDepth ? 0.1f : 1.0f;
-            pOriginalCmdSetViewport(cmd, localState.firstViewport, 1, &hVp);
-        }
-
-        // 2) Solid wallhack pass (model visible through every texture)
-        if (wantWall && pOriginalCmdDrawIndexed)
-            pOriginalCmdDrawIndexedIndirect(cmd, buffer, offset, drawCount, stride);
-
-        // 3) Colour pass (drawn last → always visible, also through walls)
-        if (wantColor)
-        {
-            if (pOriginalCmdBindPipeline)
-                pOriginalCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, highlight);
-
-            if (pOriginalCmdDrawIndexed)
-                pOriginalCmdDrawIndexedIndirect(cmd, buffer, offset, drawCount, stride);
-
-            if (pOriginalCmdBindPipeline)
-                pOriginalCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, original);
-        }
-
-        // Restore original viewport
-        if (wantWall && pOriginalCmdSetViewport)
-            pOriginalCmdSetViewport(cmd, localState.firstViewport, 1, &localState.currentViewport);
-    }
-    */
     return pOriginalCmdDrawIndexedIndirect(cmd, buffer, offset, drawCount, stride);
 }
 
@@ -2009,16 +1967,32 @@ void VKAPI_CALL DetourVkDestroyPipeline(
     }
 }
  
-/*
+
 //to do:
 // ============================================================================
 // Lifetime / cleanup detours
 // ============================================================================
+void ClearCmdState(VkCommandBuffer cmd)
+{
+    if (!cmd) return;
+
+    {
+        std::unique_lock<std::shared_mutex> lock(statesMtx);
+        cmdStates.erase(cmd);
+    }
+
+    std::lock_guard<std::mutex> lock(g_mtx);
+    g_cmdBufStride.erase(cmd);
+    g_cmdBufVertexInput.erase(cmd);
+    g_curKey.erase(cmd);
+    g_curPipeline.erase(cmd);
+}
+
 VkResult VKAPI_CALL DetourVkResetCommandBuffer(
     VkCommandBuffer commandBuffer,
     VkCommandBufferResetFlags flags)
 {
-    RemoveCmdState(commandBuffer);
+    ClearCmdState(commandBuffer);
     return pOriginalResetCommandBuffer
         ? pOriginalResetCommandBuffer(commandBuffer, flags)
         : VK_SUCCESS;
@@ -2033,14 +2007,12 @@ void VKAPI_CALL DetourVkFreeCommandBuffers(
     if (pCommandBuffers)
     {
         for (uint32_t i = 0; i < commandBufferCount; ++i)
-            RemoveCmdState(pCommandBuffers[i]);
+            ClearCmdState(pCommandBuffers[i]);
     }
 
     if (pOriginalFreeCommandBuffers)
-        pOriginalFreeCommandBuffers(device, commandPool,
-            commandBufferCount, pCommandBuffers);
+        pOriginalFreeCommandBuffers(device, commandPool, commandBufferCount, pCommandBuffers);
 }
-*/
 
 //===================================================================================================//
 
@@ -2152,7 +2124,8 @@ static bool HookViaDummyDevice()
         { "vkCmdDrawIndexed",          (void*)DetourVkCmdDrawIndexed,          (void**)&pOriginalCmdDrawIndexed },
         { "vkCmdDrawIndexedIndirect",  (void*)DetourVkCmdDrawIndexedIndirect,  (void**)&pOriginalCmdDrawIndexedIndirect },
         { "vkDestroyPipeline",         (void*)DetourVkDestroyPipeline,         (void**)&pOriginalDestroyPipeline },
-        
+        { "vkResetCommandBuffer",      (void*)DetourVkResetCommandBuffer,      (void**)&pOriginalResetCommandBuffer },
+        { "vkFreeCommandBuffers",      (void*)DetourVkFreeCommandBuffers,      (void**)&pOriginalFreeCommandBuffers },
     };
 
     bool anyPatched = false;
@@ -2264,8 +2237,8 @@ DWORD WINAPI InputThread(LPVOID lpParam) {
         bool c1 = GetAsyncKeyState(VK_F1) & 0x8000;
         bool c2 = GetAsyncKeyState(VK_F3) & 0x8000;
 
-        if (c1 && !p1) wallhack ^= 1;
-        if (c2 && !p2) colorhack ^= 1;
+        if (c1 && !p1) wallhack = !wallhack;   // or wallhack.store(!wallhack.load());
+        if (c2 && !p2) colorhack = !colorhack;
 
         p1 = c1; p2 = c2;
         Sleep(2);
