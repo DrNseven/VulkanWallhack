@@ -238,15 +238,33 @@ static const uint32_t kGreenFragSpv[] = {
 };
 
 // One module per device, created lazily, intentionally never destroyed.
+static std::mutex                  g_redFragMtx;
+static std::unordered_map<VkDevice, VkShaderModule> g_redFragMods;
+
 static VkShaderModule GetRedFragModule(VkDevice device)
 {
-    static std::mutex s_mtx;
-    static std::unordered_map<VkDevice, VkShaderModule> s_mods;
+    //Log("GetRedFragModule enter, pOriginal = %p, device = %p", (void*)pOriginalCreateShaderModule, (void*)device);
 
-    std::lock_guard<std::mutex> lk(s_mtx);
-    auto it = s_mods.find(device);
-    if (it != s_mods.end())
+    if (!pOriginalCreateShaderModule)
+    {
+        //Log("GetRedFragModule: NULL original – abort");
+        return VK_NULL_HANDLE;
+    }
+
+    //Log("GetRedFragModule: locking");
+    std::lock_guard<std::mutex> lk(g_redFragMtx);
+    //Log("GetRedFragModule: locked");
+
+    auto it = g_redFragMods.find(device);
+    //Log("GetRedFragModule: after find");
+
+    if (it != g_redFragMods.end())
+    {
+        //Log("GetRedFragModule: cache hit %p", (void*)it->second);
         return it->second;
+    }
+
+    //Log("GetRedFragModule: creating new module");
 
     VkShaderModuleCreateInfo mci{};
     mci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
@@ -254,12 +272,18 @@ static VkShaderModule GetRedFragModule(VkDevice device)
     mci.pCode = kRedFragSpv;
 
     VkShaderModule m = VK_NULL_HANDLE;
-    if (pOriginalCreateShaderModule(device, &mci, nullptr, &m) != VK_SUCCESS)
+
+    //Log("GetRedFragModule: calling original CreateShaderModule");
+    VkResult res = pOriginalCreateShaderModule(device, &mci, nullptr, &m);
+    //Log("GetRedFragModule: original returned %d, module = %p", (int)res, (void*)m);
+
+    if (res != VK_SUCCESS)
     {
-        Log("GetRedFragModule: vkCreateShaderModule FAILED");
+        Log("GetRedFragModule: FAILED");
         m = VK_NULL_HANDLE;
     }
-    s_mods[device] = m;
+
+    g_redFragMods[device] = m;
     return m;
 }
 
@@ -784,36 +808,51 @@ VKAPI_ATTR VkResult VKAPI_CALL DetourVkCreateGraphicsPipelines(
         VkResult   hr = VK_SUCCESS;
         bool       attempted = false;
         VkGraphicsPipelineLibraryFlagsEXT twinParts = 0;
+        //Log("1");
+        //Log("stride == %d", stride);
+        //const bool strideWanted = true;
+        //const bool strideWanted = (stride == kHighlightStride) || strideUnknown;
+        const bool strideWanted = (stride >= 1) || strideUnknown;
+        //Log("2");
 
-        const bool strideWanted = (stride == kHighlightStride) || strideUnknown;
+        //Log("isLinked == %d && ownsFS == %d && realDepthTest == %d && isLibrary == %d && ownsFO == %d && hasFrag == %d",
+            //isLinked, ownsFS, realDepthTest, isLibrary, ownsFO, hasFrag);
 
-        if (!isLinked && (!ownsFS || realDepthTest) &&
-            (isLibrary ? (ownsFS || ownsFO) : (hasFrag && strideWanted)))
+        if (!isLinked && (!ownsFS || realDepthTest) && (isLibrary ? (ownsFS || ownsFO) : (hasFrag && strideWanted)))
+        //if (!isLinked && (isLibrary ? (ownsFS || ownsFO) : (hasFrag && strideWanted)))
         {
-            // (A) FS / FO library: always make a twin (cheap: trivial shader / no shaders).
-            //     The stride filter is applied later, when a final pipeline links it.
-            // (B) monolithic pipeline: only when the stride matches / is dynamic.
-            VkShaderModule red = ownsFS ? GetRedFragModule(device) : VK_NULL_HANDLE;
+            //Log("3");
 
+            //Log("3a – calling GetRedFragModule");
+            VkShaderModule red = ownsFS ? GetRedFragModule(device) : VK_NULL_HANDLE;
+            //Log("3b – red = %p", (void*)red);
+
+            //Log("3c – calling BuildHighlightCI");
             HighlightStorage hs;
             VkGraphicsPipelineCreateInfo hci;
             twinParts = BuildHighlightCI(ci, owned, red, hs, hci);
+            //Log("3d – twinParts = 0x%x", (unsigned)twinParts);
 
             const bool complete = isLibrary
                 ? (twinParts != 0)
                 : ((twinParts & (kGplFS | kGplFO)) == (kGplFS | kGplFO));
+            //Log("3e – complete = %d", (int)complete);
 
             if (complete)
             {
+                //Log("3f – calling CreateGraphicsPipelines for highlight");
                 attempted = true;
                 hr = pOriginalCreateGraphicsPipelines(device, cache, 1, &hci, pAllocator, &highlightPipe);
+                //Log("3g – hr = %d  highlight = %p", (int)hr, (void*)highlightPipe);
             }
+            //Log("3h – finished");
         }
 
         else if (isLinked && swapped && !ownsFS && !ownsFO &&
             (isLibrary || (hasFrag && strideWanted &&
                 (swappedParts & (kGplFS | kGplFO)) == (kGplFS | kGplFO))))
         {
+            //Log("4");
             // Safe copy – never mutate the application's create-info
             VkGraphicsPipelineCreateInfo hci = ci;
             hci.flags &= ~(VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT |
@@ -839,37 +878,14 @@ VKAPI_ATTR VkResult VKAPI_CALL DetourVkCreateGraphicsPipelines(
             twinParts = swappedParts;
             hr = pOriginalCreateGraphicsPipelines(device, cache, 1, &hci, pAllocator, &highlightPipe);
         }
-        /*
-        //not ideal (but last working)
-        else if (isLinked && swapped && !ownsFS && !ownsFO &&
-            (isLibrary || (hasFrag && strideWanted &&
-                (swappedParts & (kGplFS | kGplFO)) == (kGplFS | kGplFO))))
-        {
-            // (C) linked pipeline: same libraries, but FS and FO libraries are replaced
-            //     by their highlight twins. Everything else is shared with the original.
-            VkGraphicsPipelineCreateInfo hci = ci;
-            hci.flags &= ~(VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT |
-                VK_PIPELINE_CREATE_DERIVATIVE_BIT);
-            hci.basePipelineHandle = VK_NULL_HANDLE;
-            hci.basePipelineIndex = -1;
 
-            // Temporarily point the game's lib-info at our array; restored right after.
-            auto* mli = const_cast<VkPipelineLibraryCreateInfoKHR*>(li);
-            const VkPipeline* savedLibs = mli->pLibraries;
-            mli->pLibraries = hlLibs.data();
-
-            attempted = true;
-            twinParts = swappedParts;
-            hr = pOriginalCreateGraphicsPipelines(device, cache, 1, &hci, pAllocator, &highlightPipe);
-
-            mli->pLibraries = savedLibs;
-        }
-        */
-
+        //Log("5");
         if (attempted)
         {
+            //Log("6");
             if (hr == VK_SUCCESS && highlightPipe != VK_NULL_HANDLE)
             {
+                //Log("7");
                 if (isLibrary)
                 {
                     e.lib.highlightLib = highlightPipe;
@@ -1736,8 +1752,8 @@ void VKAPI_CALL DetourVkCmdDrawIndexed(VkCommandBuffer cmd, uint32_t idxCount, u
     const uint32_t shortkey = static_cast<uint32_t>(key % 100); //model recognition option 2
 
     //bruteforce stride
-    //if (stride == countnum)
-    //return;
+    if (stride == countnum)
+    return;
         //Log("shortkey == %d && stride == %d", shortkey, stride);
 
 
@@ -1913,7 +1929,7 @@ static bool HookFn(const char* name, PFN_vkVoidFunction fn, void* detour, void**
     if (s == MH_OK)
         s = MH_EnableHook((void*)fn);
 
-    Log("hook %s @%p -> %s", name, (void*)fn, MH_StatusToString(s));
+    //Log("hook %s @%p -> %s", name, (void*)fn, MH_StatusToString(s));
 
     if (s == MH_OK)
     {
