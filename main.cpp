@@ -22,10 +22,10 @@
 //===================================================================================================//
 
 // --- Globals ---
-int countnum = -1;
-std::atomic<bool> wallhack{ false };
+int countstride = 40; //40 = valheim, 48 = zombie army 4: dead war(reversedDepth=true), 28 = deadlock
+std::atomic<bool> wallhack{ true };
 std::atomic<bool> colorhack{ false };
-static constexpr uint32_t kHighlightStride = 40;   //40 = valheim, 48 = zombie army 4: dead war(reversedDepth=true), 28 = deadlock
+std::atomic<bool> logvalues{ false };
 
 //Log
 inline void Log(const char* fmt, ...) {
@@ -1702,13 +1702,13 @@ void VKAPI_CALL DetourVkCmdDrawIndexed(VkCommandBuffer cmd, uint32_t idxCount, u
 
 
     // Bruteforce stride (By pressing the keys: . and ,)
-    if (stride == countnum)
-    return;
-        //Log("shortkey == %d && stride == %d", shortkey, stride);
+    if (stride == countstride)
+    if(logvalues) //press F5 to log, press F5 again to stop logging
+        Log("stride == %d && shortkey == %d && idxCount == %d", stride, shortkey, idxCount);
 
 
     // Model recognition
-    if (stride != kHighlightStride) //40 = valheim, 48 = zombie army 4: dead war(reversedDepth=true), 28,56? = deadlock
+    if (stride != countstride) //40 = valheim, 48 = zombie army 4: dead war(reversedDepth=true), 28,56? = deadlock
     {
         if (pOriginalCmdDrawIndexed)
             pOriginalCmdDrawIndexed(cmd, idxCount, instCount, firstIdx, vtxOff, firstInst);
@@ -2127,19 +2127,21 @@ DWORD WINAPI HookThread(LPVOID)
 }
 
 DWORD WINAPI InputThread(LPVOID lpParam) {
-    bool p1 = false, p2 = false;
+    bool p1 = false, p2 = false, p3 = false;
     while (true) {
-        if (GetAsyncKeyState(VK_OEM_COMMA) & 1) { countnum--; }
-        if (GetAsyncKeyState(VK_OEM_PERIOD) & 1) { countnum++; }
-        if (GetAsyncKeyState(VK_OEM_MINUS) & 1) { countnum = -1; }
+        if (GetAsyncKeyState(VK_OEM_COMMA) & 1) { countstride--; }
+        if (GetAsyncKeyState(VK_OEM_PERIOD) & 1) { countstride++; }
+        if (GetAsyncKeyState(VK_OEM_MINUS) & 1) { countstride = -1; }
 
-        bool c1 = GetAsyncKeyState(VK_F1) & 0x8000;
-        bool c2 = GetAsyncKeyState(VK_F3) & 0x8000;
+        bool c1 = GetAsyncKeyState(VK_F3) & 0x8000;
+        bool c2 = GetAsyncKeyState(VK_F4) & 0x8000;
+        bool c3 = GetAsyncKeyState(VK_F5) & 0x8000;
 
         if (c1 && !p1) wallhack = !wallhack;   
         if (c2 && !p2) colorhack = !colorhack;
+        if (c3 && !p3) logvalues = !logvalues;
 
-        p1 = c1; p2 = c2;
+        p1 = c1; p2 = c2, p3 = c3;
         Sleep(2);
     }
     return 0;
