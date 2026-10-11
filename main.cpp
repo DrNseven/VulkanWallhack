@@ -1,7 +1,8 @@
 ﻿// Vulkan Hook/Wallhack
 // Bruteforce stride (By pressing the keys: . and ,)
-// Toggle wallhack = F1
-// Toggle color = F3
+// Toggle wallhack = F3
+// Toggle color = F4
+// Toggle logging = F5
 #define NOMINMAX
 #include <Windows.h>
 #include <iostream>
@@ -24,9 +25,9 @@
 //===================================================================================================//
 
 // --- Globals ---
-int countstride = 40; //40 = valheim, 48 = zombie army 4: dead war(reversedDepth=true), 28 = deadlock
+int countstride = 1; //40 = valheim, 48 = zombie army 4: dead war(reversedDepth=true), 28 = deadlock
 std::atomic<bool> wallhack{ true };
-std::atomic<bool> colorhack{ false };
+std::atomic<bool> colorhack{ true };
 std::atomic<bool> logvalues{ false };
 
 //Log
@@ -104,7 +105,6 @@ void RemoveCmdState(VkCommandBuffer cmd)
 {
     if (!cmd) return;
     std::unique_lock<std::shared_mutex> lock(statesMtx);
-    //std::unique_lock lock(statesMtx);
     cmdStates.erase(cmd);
 }
 
@@ -255,6 +255,7 @@ struct LibInfo
     // depth/stencil setup of the fragment-shader part (diagnostics only; -1 = unknown)
     int  depthTest = -1, depthOp = -1, depthWrite = -1, stencilTest = -1;
     bool depthDyn = false;                             // any depth/stencil state is dynamic
+    bool viewportDyn = false;   // VK_DYNAMIC_STATE_VIEWPORT or _WITH_COUNT
 };
 
 std::unordered_map<VkPipeline, LibInfo> g_libInfo;     // guarded by g_mtx
@@ -270,10 +271,145 @@ struct HighlightStorage
 {
     std::vector<VkPipelineShaderStageCreateInfo>     stages;
     std::vector<VkPipelineColorBlendAttachmentState> attachments;
+    std::vector<VkDynamicState>                      dynStates;   // <-- NEW
     VkPipelineColorBlendStateCreateInfo              blend{};
     VkPipelineDepthStencilStateCreateInfo            depth{};
+    VkPipelineDynamicStateCreateInfo                 dyn{};       // <-- NEW (owned by us)
 };
 
+static VkGraphicsPipelineLibraryFlagsEXT BuildHighlightCI(
+    const VkGraphicsPipelineCreateInfo& ci,
+    VkGraphicsPipelineLibraryFlagsEXT owned,
+    VkShaderModule red,
+    HighlightStorage& hs,
+    VkGraphicsPipelineCreateInfo& out)
+{
+    VkGraphicsPipelineLibraryFlagsEXT modified = 0;
+    out = ci;
+
+    // Clear flags that are problematic for our twin
+    out.flags &= ~(VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT |
+        VK_PIPELINE_CREATE_DERIVATIVE_BIT);
+    out.basePipelineHandle = VK_NULL_HANDLE;
+    out.basePipelineIndex = -1;
+
+    // ------------------------------------------------------------------
+    // Fragment shader stage replacement (unchanged)
+    // ------------------------------------------------------------------
+    if ((owned & kGplFS) && ci.pStages && ci.stageCount > 0 && red != VK_NULL_HANDLE)
+    {
+        hs.stages.assign(ci.pStages, ci.pStages + ci.stageCount);
+        for (auto& st : hs.stages)
+        {
+            if (st.stage == VK_SHADER_STAGE_FRAGMENT_BIT)
+            {
+                st.pNext = nullptr;
+                st.flags = 0;
+                st.module = red;
+                st.pName = "main";
+                st.pSpecializationInfo = nullptr;
+                modified |= kGplFS;
+            }
+        }
+        if (modified & kGplFS)
+            out.pStages = hs.stages.data();
+    }
+
+    // ------------------------------------------------------------------
+    // Depth/stencil – true wallhack overlay (your current version)
+    // ------------------------------------------------------------------
+    if ((owned & kGplFS) && ci.pDepthStencilState)
+    {
+        hs.depth = *ci.pDepthStencilState;
+
+        hs.depth.depthTestEnable = VK_FALSE;
+        hs.depth.depthCompareOp = VK_COMPARE_OP_ALWAYS;
+        hs.depth.depthWriteEnable = VK_FALSE;
+        hs.depth.stencilTestEnable = VK_FALSE;
+
+        hs.depth.front.failOp = hs.depth.front.passOp = hs.depth.front.depthFailOp = VK_STENCIL_OP_KEEP;
+        hs.depth.back.failOp = hs.depth.back.passOp = hs.depth.back.depthFailOp = VK_STENCIL_OP_KEEP;
+        hs.depth.front.writeMask = 0;
+        hs.depth.back.writeMask = 0;
+
+        out.pDepthStencilState = &hs.depth;
+        // (no need to set modified here – depth lives in FS part)
+    }
+
+    // ------------------------------------------------------------------
+    // Fragment output – write only RGB of RT0 (unchanged)
+    // ------------------------------------------------------------------
+    if ((owned & kGplFO) && ci.pColorBlendState &&
+        ci.pColorBlendState->attachmentCount > 0 && ci.pColorBlendState->pAttachments)
+    {
+        hs.attachments.assign(ci.pColorBlendState->attachmentCount, VkPipelineColorBlendAttachmentState{});
+        for (size_t a = 0; a < hs.attachments.size(); ++a)
+        {
+            auto& att = hs.attachments[a];
+            att.blendEnable = VK_FALSE;
+            att.colorWriteMask = (a == 0)
+                ? (VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT)
+                : 0;
+        }
+        hs.blend = *ci.pColorBlendState;
+        hs.blend.logicOpEnable = VK_FALSE;
+        hs.blend.pAttachments = hs.attachments.data();
+        out.pColorBlendState = &hs.blend;
+        modified |= kGplFO;
+    }
+
+    // ------------------------------------------------------------------
+    // NEW: Force dynamic viewport
+    // ------------------------------------------------------------------
+    // We always make viewport dynamic on the highlight so that the
+    // later vkCmdSetViewport / vkCmdSetViewportWithCount calls actually work.
+    {
+        hs.dynStates.clear();
+
+        // Copy existing dynamic states (if any)
+        if (ci.pDynamicState && ci.pDynamicState->pDynamicStates &&
+            ci.pDynamicState->dynamicStateCount > 0)
+        {
+            hs.dynStates.assign(
+                ci.pDynamicState->pDynamicStates,
+                ci.pDynamicState->pDynamicStates + ci.pDynamicState->dynamicStateCount);
+        }
+
+        // Check whether viewport is already dynamic
+        bool hasViewport = false;
+        bool hasViewportWithCount = false;
+        for (VkDynamicState s : hs.dynStates)
+        {
+            if (s == VK_DYNAMIC_STATE_VIEWPORT)
+                hasViewport = true;
+            if (s == VK_DYNAMIC_STATE_VIEWPORT_WITH_COUNT)
+                hasViewportWithCount = true;
+        }
+
+        // Prefer the variant the game is actually using.
+        // Most idTech titles use the classic VIEWPORT, but some use WITH_COUNT.
+        if (!hasViewport && !hasViewportWithCount)
+        {
+            // Default to classic – change to WITH_COUNT if your logs show the game uses it
+            hs.dynStates.push_back(VK_DYNAMIC_STATE_VIEWPORT);
+        }
+        // If the game already uses one of them we leave it alone.
+
+        // Build our own dynamic-state create info that owns the memory
+        hs.dyn.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+        hs.dyn.pNext = nullptr;
+        hs.dyn.flags = 0;
+        hs.dyn.dynamicStateCount = static_cast<uint32_t>(hs.dynStates.size());
+        hs.dyn.pDynamicStates = hs.dynStates.data();
+
+        out.pDynamicState = &hs.dyn;
+    }
+
+    return modified;
+}
+
+
+/*
 // Builds the highlight create-info for whatever parts `owned` covers:
 //   fragment-shader part  -> fragment stage replaced by the flat-red shader
 //   fragment-output part  -> blending off; RT0 writes RGBA, other RTs write nothing
@@ -313,6 +449,7 @@ static VkGraphicsPipelineLibraryFlagsEXT BuildHighlightCI(
             out.pStages = hs.stages.data();
     }
 
+    //no
     // ---- depth/stencil: the highlight is an OVERLAY drawn after the game's own draw ----
     // The original draw already wrote depth, so the overlay must pass on equal depth,
     // and must not write depth or stencil. 
@@ -347,58 +484,60 @@ static VkGraphicsPipelineLibraryFlagsEXT BuildHighlightCI(
         hs.depth.front.writeMask = 0;
         hs.depth.back.writeMask = 0;
         out.pDepthStencilState = &hs.depth;
-    }
-
-    /*
-   //VK_COMPARE_OP_ALWAYS wallhack works too, better for fps, BUT does not punch though all walls
-   // ---- depth/stencil: make the highlight a true wallhack overlay ----
-   if ((owned & kGplFS) && ci.pDepthStencilState)
-   {
-       hs.depth = *ci.pDepthStencilState;
-
-       // Force always-pass + no depth write
-       hs.depth.depthTestEnable = VK_TRUE;               // keep test enabled so the op is used
-       hs.depth.depthCompareOp = VK_COMPARE_OP_ALWAYS;  //
-       hs.depth.depthWriteEnable = VK_FALSE;
-
-       // Never touch stencil
-       hs.depth.front.failOp = hs.depth.front.passOp = hs.depth.front.depthFailOp = VK_STENCIL_OP_KEEP;
-       hs.depth.back.failOp = hs.depth.back.passOp = hs.depth.back.depthFailOp = VK_STENCIL_OP_KEEP;
-       hs.depth.front.writeMask = 0;
-       hs.depth.back.writeMask = 0;
-
-       out.pDepthStencilState = &hs.depth;
-   }
-   */
-
-   /*
-   //same effect as above
-   if ((owned & kGplFS) && ci.pDepthStencilState)
-   {
-       hs.depth = *ci.pDepthStencilState;
-
-       hs.depth.depthTestEnable = VK_FALSE;
-       hs.depth.depthWriteEnable = VK_FALSE;
-       hs.depth.stencilTestEnable = VK_FALSE;
-
-       out.pDepthStencilState = &hs.depth;
-   }
-   */   
-
-   /*
-    //This version has bug that disables depth too, wallhack effect
-    // The original draw already wrote depth, so the overlay must pass on equal depth,
-    // must not write depth, and must not be rejected by the game's stencil setup.
+    }    
+    
+    
+    //no
+    //ALTERNATIVE wallhack with VK_COMPARE_OP_ALWAYS, good for fps, BUT does not punch though all walls
+    // this is also for DOOM 2016
+    // ---- depth/stencil: make the highlight a true wallhack overlay ----
     if ((owned & kGplFS) && ci.pDepthStencilState)
     {
         hs.depth = *ci.pDepthStencilState;
-        if (hs.depth.depthTestEnable)
-            hs.depth.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
+
+        // Force always-pass + no depth write
+        hs.depth.depthTestEnable = VK_FALSE; //VK_TRUE;               // keep test enabled so the op is used
+        hs.depth.depthCompareOp = VK_COMPARE_OP_ALWAYS;  //
         hs.depth.depthWriteEnable = VK_FALSE;
-        hs.depth.stencilTestEnable = VK_FALSE;
+
+        // Never touch stencil
+        hs.depth.front.failOp = hs.depth.front.passOp = hs.depth.front.depthFailOp = VK_STENCIL_OP_KEEP;
+        hs.depth.back.failOp = hs.depth.back.passOp = hs.depth.back.depthFailOp = VK_STENCIL_OP_KEEP;
+        hs.depth.front.writeMask = 0;
+        hs.depth.back.writeMask = 0;
+
         out.pDepthStencilState = &hs.depth;
     }
-    */
+    
+
+    
+    //same as above
+    if ((owned & kGplFS) && ci.pDepthStencilState)
+    {
+        hs.depth = *ci.pDepthStencilState;
+
+        // True wallhack / chams
+        hs.depth.depthTestEnable = VK_FALSE;
+        hs.depth.depthCompareOp = VK_COMPARE_OP_ALWAYS;
+        hs.depth.depthWriteEnable = VK_FALSE;
+
+        // Also kill the stencil test completely
+        hs.depth.stencilTestEnable = VK_FALSE;
+
+        // Safety: never modify stencil values even if something re-enables the test
+        hs.depth.front.failOp = hs.depth.front.passOp = hs.depth.front.depthFailOp = VK_STENCIL_OP_KEEP;
+        hs.depth.back.failOp = hs.depth.back.passOp = hs.depth.back.depthFailOp = VK_STENCIL_OP_KEEP;
+        hs.depth.front.writeMask = 0;
+        hs.depth.back.writeMask = 0;
+
+        out.pDepthStencilState = &hs.depth;
+
+        //static std::atomic<int> s_depthLogs{ 0 };
+        //if (s_depthLogs.fetch_add(1) < 1)
+            //Log("highlight depth forced: test=%d op=%d write=%d  stencilTest=%d",
+                //(int)hs.depth.depthTestEnable,(int)hs.depth.depthCompareOp,(int)hs.depth.depthWriteEnable,(int)hs.depth.stencilTestEnable);
+    }
+    
 
     // ---- fragment output: overlay writes RGB of RT0 only ----
     // Every other attachment (normals, motion vectors, masks, ...) and the alpha
@@ -425,6 +564,7 @@ static VkGraphicsPipelineLibraryFlagsEXT BuildHighlightCI(
 
     return modified;
 }
+*/
 
 // ---- the detour -------------------------------------------------------------
 VKAPI_ATTR VkResult VKAPI_CALL DetourVkCreateGraphicsPipelines(
@@ -478,6 +618,7 @@ VKAPI_ATTR VkResult VKAPI_CALL DetourVkCreateGraphicsPipelines(
         bool strideDyn = false;
         bool vinDyn = false;
         bool depthDyn = false;
+        bool viewportDyn = false;
 
         if (ci.pDynamicState && ci.pDynamicState->pDynamicStates)
         {
@@ -490,6 +631,10 @@ VKAPI_ATTR VkResult VKAPI_CALL DetourVkCreateGraphicsPipelines(
                     s == VK_DYNAMIC_STATE_DEPTH_COMPARE_OP || s == VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE ||
                     s == VK_DYNAMIC_STATE_STENCIL_OP)
                     depthDyn = true;
+
+                if (s == VK_DYNAMIC_STATE_VIEWPORT ||
+                    s == VK_DYNAMIC_STATE_VIEWPORT_WITH_COUNT)
+                    viewportDyn = true;
             }
         }
 
@@ -716,7 +861,8 @@ VKAPI_ATTR VkResult VKAPI_CALL DetourVkCreateGraphicsPipelines(
                 key = combine(key, att.blendEnable ? 1ull : 0ull);
                 key = combine(key, att.colorWriteMask);
             }
-        }
+        } 
+
 
         // Linked pipelines: fold in the libraries' keys (a linked final has no stages / vertex input of its own, so without this all finals collide).
         if (isLinked)
@@ -886,6 +1032,7 @@ VKAPI_ATTR VkResult VKAPI_CALL DetourVkCreateGraphicsPipelines(
             e.lib.depthTest = dTest;   e.lib.depthOp = dOp;
             e.lib.depthWrite = dWrite; e.lib.stencilTest = dStencil;
             e.lib.depthDyn = dDyn;
+            e.lib.viewportDyn = viewportDyn;
         }
 
         entries.push_back(e);
@@ -1041,7 +1188,6 @@ void VKAPI_CALL DetourVkCmdSetVertexInputEXT(
 
 //===================================================================================================//
 
-//Viewport wallhack punches through all walls, but worse for fps
 void VKAPI_CALL DetourVkCmdDrawIndexed(VkCommandBuffer cmd, uint32_t idxCount, uint32_t instCount,
     uint32_t firstIdx, int32_t vtxOff, uint32_t firstInst)
 {
@@ -1082,13 +1228,18 @@ void VKAPI_CALL DetourVkCmdDrawIndexed(VkCommandBuffer cmd, uint32_t idxCount, u
 
 
     // Bruteforce stride (By pressing the keys period(.) and comma(,), minus(-) will reset it -1 again.
-    if (stride == countstride)
-    if(logvalues) //press F5 to log, press F5 again to stop logging
-        Log("stride == %d && shortkey == %d && idxCount == %d", stride, shortkey, idxCount);
+    //if (shortkey == countstride)
+    //if(logvalues) //press F5 to log, press F5 again to stop logging
+        //Log("stride == %d && dstride == %d && pstride == %d && shortkey == %d && idxCount == %d", stride, dstride, pstride, shortkey, idxCount);
 
 
     // Model recognition
-    if (stride != countstride) //40 = valheim, 48 = zombie army 4: dead war(reversedDepth=true), 28,56? = deadlock
+    //if (stride != countstride) //countride = 40 by default, 40 = valheim, 48 = zombie army 4: dead war(reversedDepth=true), 28,56? = deadlock
+    //if (stride != 28 && stride != 56) //+44? deadlock
+    //if (stride != 48) //zomby army 4
+    //if (shortkey != 10) //doom 2016
+    if (shortkey != 64) //wolfenstein II: the new colossus
+    //if (stride != 40)
     {
         if (pOriginalCmdDrawIndexed)
             pOriginalCmdDrawIndexed(cmd, idxCount, instCount, firstIdx, vtxOff, firstInst);
@@ -1108,7 +1259,7 @@ void VKAPI_CALL DetourVkCmdDrawIndexed(VkCommandBuffer cmd, uint32_t idxCount, u
         }
     }
 
-
+    
     bool wantColor = (original != VK_NULL_HANDLE && highlight != VK_NULL_HANDLE);
     bool wantWall = hasVp;
 
@@ -1157,21 +1308,133 @@ void VKAPI_CALL DetourVkCmdDrawIndexed(VkCommandBuffer cmd, uint32_t idxCount, u
         if (wantWall && pOriginalCmdSetViewport)
             pOriginalCmdSetViewport(cmd, localState.firstViewport, 1, &localState.currentViewport);
     }
+    
+    //return pOriginalCmdDrawIndexed(cmd, idxCount, instCount, firstIdx, vtxOff, firstInst);
 }
 
 //===================================================================================================//
 
-void VKAPI_CALL DetourVkCmdDrawIndexedIndirect(VkCommandBuffer cmd, VkBuffer buffer, VkDeviceSize offset, uint32_t drawCount, uint32_t stride)
+void VKAPI_CALL DetourVkCmdDrawIndexedIndirect(VkCommandBuffer cmd, VkBuffer buffer, VkDeviceSize offset, uint32_t drawCount, uint32_t istride)
 {
     static bool loggedOnce = false;
     if (!loggedOnce) {
         Log("DetourVkCmdDrawIndexedIndirect");
         loggedOnce = true;
     }
- 
-    //if game is drawing models in this fuction, paste code from DrawIndexed here and rename stride to istride
+    /*
+    //if game is drawing models in DrawIndexedIndirect, paste code from DrawIndexed here
+    VkPipeline original = VK_NULL_HANDLE;
+    VkPipeline highlight = VK_NULL_HANDLE;
+    uint32_t   dstride = 0;
+    uint32_t   pstride = 0;
+    uint64_t   key = 0;
 
-    return pOriginalCmdDrawIndexedIndirect(cmd, buffer, offset, drawCount, stride);
+    {
+        std::lock_guard<std::mutex> lock(g_mtx);
+        auto pit = g_curPipeline.find(cmd);
+        if (pit != g_curPipeline.end())
+        {
+            original = pit->second;
+            auto hit = g_highlightPipelines.find(original);
+            if (hit != g_highlightPipelines.end())
+                highlight = hit->second;
+            auto pst = g_pipelineStrides.find(original);
+            if (pst != g_pipelineStrides.end())
+                pstride = pst->second;
+        }
+        auto sit = g_cmdBufStride.find(cmd);
+        if (sit != g_cmdBufStride.end())
+            dstride = sit->second;
+        auto kit = g_curKey.find(cmd);
+        if (kit != g_curKey.end())
+            key = kit->second;
+    }
+    const uint32_t stride = dstride ? dstride : pstride; //model recognition option 1
+    const uint32_t shortkey = static_cast<uint32_t>(key % 100); //model recognition option 2
+
+
+    // Bruteforce stride (By pressing the keys period(.) and comma(,), minus(-) will reset it -1 again.
+    if (stride == countstride)
+    if(logvalues) //press F5 to log, press F5 again to stop logging
+        Log("stride == %d && dstride == %d && pstride == %d && shortkey == %d", stride, dstride, pstride, shortkey);
+
+
+    // Model recognition
+    if (stride != countstride) //countride = 40 by default, 40 = valheim, 48 = zombie army 4: dead war(reversedDepth=true), 28,56? = deadlock
+    //if (stride != 28 && stride != 56) //+44? deadlock
+    //if (stride != 48) //zomby army 4
+    //if(shortkey != 10)//doom 2016
+    //if (shortkey != countstride)
+    {
+        if (pOriginalCmdDrawIndexed)
+            pOriginalCmdDrawIndexedIndirect(cmd, buffer, offset, drawCount, istride);
+        return;
+    }
+
+    // Capture viewport
+    bool hasVp = false;
+    CmdState localState{};
+    {
+        std::shared_lock<std::shared_mutex> lock(statesMtx);
+        auto it = cmdStates.find(cmd);
+        if (it != cmdStates.end() && it->second.hasViewport)
+        {
+            localState = it->second;
+            hasVp = true;
+        }
+    }
+
+
+    bool wantColor = (original != VK_NULL_HANDLE && highlight != VK_NULL_HANDLE);
+    bool wantWall = hasVp;
+
+    if (!wallhack)  wantWall = false;
+    if (!colorhack) wantColor = false;
+
+    // ------------------------------------------------------------------
+    // 1) Normal draw – keeps depth buffer correct for the rest of the frame
+    // ------------------------------------------------------------------
+    if (pOriginalCmdDrawIndexed)
+        pOriginalCmdDrawIndexedIndirect(cmd, buffer, offset, drawCount, istride);
+
+    // ------------------------------------------------------------------
+    // 2) + 3) Wallhack solid + Colour  (both use modified viewport)
+    // ------------------------------------------------------------------
+    if (wantWall || wantColor)
+    {
+        // Apply wallhack viewport once for the remaining passes
+        if (wantWall && pOriginalCmdSetViewport)
+        {
+            VkViewport hVp = localState.currentViewport;
+            constexpr bool reversedDepth = false;   // set true if game uses reversed-Z (zombie army 4)
+            hVp.minDepth = reversedDepth ? 0.0f : 0.9f;
+            hVp.maxDepth = reversedDepth ? 0.1f : 1.0f;
+            pOriginalCmdSetViewport(cmd, localState.firstViewport, 1, &hVp);
+        }
+
+        // 2) Solid wallhack pass
+        if (wantWall && pOriginalCmdDrawIndexed)
+            pOriginalCmdDrawIndexedIndirect(cmd, buffer, offset, drawCount, istride);
+
+        // 3) Colour pass 
+        if (wantColor)
+        {
+            if (pOriginalCmdBindPipeline)
+                pOriginalCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, highlight);
+
+            if (pOriginalCmdDrawIndexed)
+                pOriginalCmdDrawIndexedIndirect(cmd, buffer, offset, drawCount, istride);
+
+            if (pOriginalCmdBindPipeline)
+                pOriginalCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, original);
+        }
+
+        // Restore original viewport
+        if (wantWall && pOriginalCmdSetViewport)
+            pOriginalCmdSetViewport(cmd, localState.firstViewport, 1, &localState.currentViewport);
+    }
+    */
+    //return pOriginalCmdDrawIndexedIndirect(cmd, buffer, offset, drawCount, istride);
 }
 
 //===================================================================================================//
