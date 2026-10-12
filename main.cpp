@@ -1008,12 +1008,12 @@ void VKAPI_CALL DetourVkCmdDrawIndexed(VkCommandBuffer cmd, uint32_t idxCount, u
         Log("stride == %d && dstride == %d && pstride == %d && shortkey == %d && idxCount == %d",
             stride, dstride, pstride, shortkey, idxCount);
    
-    // Model recognition – Wolfenstein II
+    // Model recognition
     if (stride != countstride) //countride = 40 by default, 40 = valheim, 48 = zombie army 4: dead war(reversedDepth=true), 28,56? = deadlock
     //if (stride != 28 && stride != 56) //+44? deadlock
     //if (stride != 48) //zomby army 4
     //if (shortkey != 10) //doom 2016
-    //if (shortkey != 64)          // change this for other games
+    //if (shortkey != 64) // wolfenstein 2: the new colossus
     {
         if (pOriginalCmdDrawIndexed)
             pOriginalCmdDrawIndexed(cmd, idxCount, instCount, firstIdx, vtxOff, firstInst);
@@ -1104,56 +1104,6 @@ void VKAPI_CALL DetourVkCmdDrawIndexed(VkCommandBuffer cmd, uint32_t idxCount, u
                 cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, original);
     }
 
-
-    /*
-    //chams
-    if (wantWall || wantColor)
-    {
-        // 1. Wallwurst pass
-        if (wantWall)
-        {
-            if (pOriginalCmdSetViewport && hasVp)
-            {
-                VkViewport hVp = localState.currentViewport;
-                hVp.minDepth = 0.0f;
-                hVp.maxDepth = 0.05f;
-
-                pOriginalCmdSetViewport(cmd, 0, 1, &hVp);
-            }
-
-            if (pOriginalCmdBindPipeline)
-                pOriginalCmdBindPipeline(
-                    cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, highlightWall);
-
-            if (pOriginalCmdDrawIndexed)
-                pOriginalCmdDrawIndexed(
-                    cmd, idxCount, instCount, firstIdx, vtxOff, firstInst);
-
-            // Restore the original viewport
-            if (pOriginalCmdSetViewport && hasVp)
-                pOriginalCmdSetViewport(
-                    cmd, localState.firstViewport, 1,
-                    &localState.currentViewport);
-        }
-
-        // 2. Color pass (independent of Wallwurst)
-        if (wantColor)
-        {
-            if (pOriginalCmdBindPipeline)
-                pOriginalCmdBindPipeline(
-                    cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, highlightColor);
-
-            if (pOriginalCmdDrawIndexed)
-                pOriginalCmdDrawIndexed(
-                    cmd, idxCount, instCount, firstIdx, vtxOff, firstInst);
-        }
-
-        // 3. Restore original pipeline
-        if (pOriginalCmdBindPipeline && original != VK_NULL_HANDLE)
-            pOriginalCmdBindPipeline(
-                cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, original);
-    }
-    */
 }
 
 //===================================================================================================//
