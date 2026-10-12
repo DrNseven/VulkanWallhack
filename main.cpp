@@ -1,8 +1,8 @@
-﻿// Vulkan Hook/Wallwurst
+﻿// Vulkan Hook/Wallhack
 // Bruteforce stride (By pressing the keys: . and ,)
-// Toggle Wallwurst = F3
+// Toggle Wallhack = F3
 // Toggle color = F4
-// Toggle logging = F5
+// Toggle logging = F6
 #define NOMINMAX
 #include <Windows.h>
 #include <iostream>
@@ -361,7 +361,7 @@ static VkGraphicsPipelineLibraryFlagsEXT BuildHighlightCI(
             auto& att = hs.attachments[a];
             att.blendEnable = VK_FALSE;
             att.colorWriteMask = (a == 0)
-                ? (VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT)
+                ? (VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT) //can change color of the shader animation here
                 : 0;
         }
         hs.blend = *ci.pColorBlendState;
@@ -1014,18 +1014,6 @@ void VKAPI_CALL DetourVkCmdDrawIndexed(VkCommandBuffer cmd, uint32_t idxCount, u
         return;
     }
 
-    /*
-    if (shortkey == 64)
-    {
-        static int n = 0;
-        if (n++ < 20)
-            Log("MATCH shortkey=64 wall=%d color=%d hlW=%p hlC=%p orig=%p key=%llu",
-                (int)Wallwurst.load(), (int)colorhack.load(),
-                (void*)highlightWall, (void*)highlightColor,
-                (void*)original, (unsigned long long)key);
-    }
-    */
-
     // ------------------------------------------------------------------
     // Capture viewport
     // ------------------------------------------------------------------
@@ -1050,6 +1038,7 @@ void VKAPI_CALL DetourVkCmdDrawIndexed(VkCommandBuffer cmd, uint32_t idxCount, u
         pOriginalCmdDrawIndexed(cmd, idxCount, instCount, firstIdx, vtxOff, firstInst);
 
 
+    //same color behind and infront of walls
     if (wantWall || wantColor)
     {
         auto applyWallViewport = [&]()
@@ -1109,71 +1098,10 @@ void VKAPI_CALL DetourVkCmdDrawIndexed(VkCommandBuffer cmd, uint32_t idxCount, u
         if (original && pOriginalCmdBindPipeline)
             pOriginalCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, original);
     }
-
-
-    /*
-    if (wantWall || wantColor)
-    {
-        auto applyWallViewport = [&]()
-            {
-                if (!pOriginalCmdSetViewport || !hasVp) return;
-                VkViewport hVp = localState.currentViewport;
-                constexpr bool reversedDepth = false;   // set true if game uses reversed-Z (zombie army 4)
-                hVp.minDepth = reversedDepth ? 0.0f : 0.9f;
-                hVp.maxDepth = reversedDepth ? 0.1f : 1.0f;
-                pOriginalCmdSetViewport(cmd, 0, 1, &hVp);
-            };
-        auto restoreViewport = [&]()
-            {
-                if (pOriginalCmdSetViewport && hasVp)
-                    pOriginalCmdSetViewport(cmd, localState.firstViewport, 1, &localState.currentViewport);
-            };
-
-        // Wall only
-        if (wantWall && !wantColor)
-        {
-            applyWallViewport();
-            if (highlightWall && pOriginalCmdBindPipeline)
-                pOriginalCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, highlightWall);
-            if (pOriginalCmdDrawIndexed)
-                pOriginalCmdDrawIndexed(cmd, idxCount, instCount, firstIdx, vtxOff, firstInst);
-            restoreViewport();
-        }
-        // Colour only
-        else if (wantColor && !wantWall)
-        {
-            if (highlightColor && pOriginalCmdBindPipeline)
-                pOriginalCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, highlightColor);
-            if (pOriginalCmdDrawIndexed)
-                pOriginalCmdDrawIndexed(cmd, idxCount, instCount, firstIdx, vtxOff, firstInst);
-        }
-        // Both → one pass, red through walls
-        else if (wantWall && wantColor)
-        {
-            applyWallViewport();
-            VkPipeline pipe = highlightBoth ? highlightBoth
-                : (highlightWall ? highlightWall : highlightColor);
-            if (pipe && pOriginalCmdBindPipeline)
-                pOriginalCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
-            if (pOriginalCmdDrawIndexed)
-                pOriginalCmdDrawIndexed(cmd, idxCount, instCount, firstIdx, vtxOff, firstInst);
-            restoreViewport();
-        }
-
-        if (original && pOriginalCmdBindPipeline)
-            pOriginalCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, original);
-    }
-    */
+    
 
     /*
-    //last working
-    bool wantColor = colorhack && (highlightColor != VK_NULL_HANDLE);
-    bool wantWall = Wallwurst && (highlightWall != VK_NULL_HANDLE);
-
-    // 1) normal draw
-    if (pOriginalCmdDrawIndexed)
-        pOriginalCmdDrawIndexed(cmd, idxCount, instCount, firstIdx, vtxOff, firstInst);
-
+    //chams effect, no color behindwalls
     if (wantWall || wantColor)
     {
         // 1. Wallwurst pass
@@ -1182,8 +1110,6 @@ void VKAPI_CALL DetourVkCmdDrawIndexed(VkCommandBuffer cmd, uint32_t idxCount, u
             if (pOriginalCmdSetViewport && hasVp)
             {
                 VkViewport hVp = localState.currentViewport;
-                //hVp.minDepth = 0.0f;
-                //hVp.maxDepth = 0.05f;
                 constexpr bool reversedDepth = false;   // set true if game uses reversed-Z (zombie army 4)
                 hVp.minDepth = reversedDepth ? 0.0f : 0.9f;
                 hVp.maxDepth = reversedDepth ? 0.1f : 1.0f;
@@ -1582,7 +1508,7 @@ DWORD WINAPI InputThread(LPVOID lpParam) {
 
         bool c1 = GetAsyncKeyState(VK_F3) & 0x8000;
         bool c2 = GetAsyncKeyState(VK_F4) & 0x8000;
-        bool c3 = GetAsyncKeyState(VK_F5) & 0x8000;
+        bool c3 = GetAsyncKeyState(VK_F6) & 0x8000;
 
         if (c1 && !p1) Wallwurst = !Wallwurst;   
         if (c2 && !p2) colorhack = !colorhack;
