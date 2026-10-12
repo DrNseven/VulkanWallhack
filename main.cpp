@@ -1,6 +1,6 @@
-﻿// Vulkan Hook/Wallhack
+﻿// Vulkan Hook/Wallwurst
 // Bruteforce stride (By pressing the keys: . and ,)
-// Toggle wallhack = F3
+// Toggle Wallwurst = F3
 // Toggle color = F4
 // Toggle logging = F5
 #define NOMINMAX
@@ -25,8 +25,8 @@
 //===================================================================================================//
 
 // --- Globals ---
-int countstride = 1; //40 = valheim, 48 = zombie army 4: dead war(reversedDepth=true), 28 = deadlock
-std::atomic<bool> wallhack{ true };
+int countstride = 40; //40 = valheim, 48 = zombie army 4: dead war(reversedDepth=true), 28 = deadlock
+std::atomic<bool> Wallwurst{ true };
 std::atomic<bool> colorhack{ true };
 std::atomic<bool> logvalues{ false };
 
@@ -85,6 +85,12 @@ PFN_vkCreateShaderModule pOriginalCreateShaderModule = nullptr;
 PFN_vkCmdSetVertexInputEXT pOriginalCmdSetVertexInputEXT = nullptr;
 PFN_vkResetCommandBuffer  pOriginalResetCommandBuffer = nullptr;
 PFN_vkFreeCommandBuffers  pOriginalFreeCommandBuffers = nullptr;
+
+//
+PFN_vkCmdSetDepthTestEnableEXT  pOriginalCmdSetDepthTestEnable = nullptr;
+PFN_vkCmdSetDepthWriteEnableEXT pOriginalCmdSetDepthWriteEnable = nullptr;
+PFN_vkCmdSetDepthCompareOpEXT   pOriginalCmdSetDepthCompareOp = nullptr;
+PFN_vkCmdSetStencilTestEnableEXT pOriginalCmdSetStencilTestEnable = nullptr;
 
 //===================================================================================================//
 
@@ -277,26 +283,36 @@ struct HighlightStorage
     VkPipelineDynamicStateCreateInfo                 dyn{};       // <-- NEW (owned by us)
 };
 
+// (you can keep g_highlightPipelines for the “both” case if you still want it)
+
+// ---------------------------------------------------------------------------
+// Updated BuildHighlightCI signature (you already have the body with the mode parameter)
+// ---------------------------------------------------------------------------
+enum HighlightMode : uint32_t
+{
+    HL_NONE = 0,
+    HL_COLOR = 1 << 0,   // replace fragment shader + FO blend
+    HL_Wallwurst = 1 << 1,   // force depth off / ALWAYS
+};
+
+
 static VkGraphicsPipelineLibraryFlagsEXT BuildHighlightCI(
     const VkGraphicsPipelineCreateInfo& ci,
     VkGraphicsPipelineLibraryFlagsEXT owned,
     VkShaderModule red,
     HighlightStorage& hs,
-    VkGraphicsPipelineCreateInfo& out)
+    VkGraphicsPipelineCreateInfo& out,
+    uint32_t mode)                     // <-- new parameter
 {
     VkGraphicsPipelineLibraryFlagsEXT modified = 0;
     out = ci;
-
-    // Clear flags that are problematic for our twin
     out.flags &= ~(VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT |
         VK_PIPELINE_CREATE_DERIVATIVE_BIT);
     out.basePipelineHandle = VK_NULL_HANDLE;
     out.basePipelineIndex = -1;
 
-    // ------------------------------------------------------------------
-    // Fragment shader stage replacement (unchanged)
-    // ------------------------------------------------------------------
-    if ((owned & kGplFS) && ci.pStages && ci.stageCount > 0 && red != VK_NULL_HANDLE)
+    // ----- Colour -----
+    if ((mode & HL_COLOR) && (owned & kGplFS) && ci.pStages && ci.stageCount > 0 && red)
     {
         hs.stages.assign(ci.pStages, ci.pStages + ci.stageCount);
         for (auto& st : hs.stages)
@@ -315,31 +331,25 @@ static VkGraphicsPipelineLibraryFlagsEXT BuildHighlightCI(
             out.pStages = hs.stages.data();
     }
 
-    // ------------------------------------------------------------------
-    // Depth/stencil – true wallhack overlay (your current version)
-    // ------------------------------------------------------------------
-    if ((owned & kGplFS) && ci.pDepthStencilState)
+    // ----- Wallwurst (depth off) -----
+    if ((mode & HL_Wallwurst) && (owned & kGplFS) && ci.pDepthStencilState)
     {
         hs.depth = *ci.pDepthStencilState;
-
         hs.depth.depthTestEnable = VK_FALSE;
         hs.depth.depthCompareOp = VK_COMPARE_OP_ALWAYS;
         hs.depth.depthWriteEnable = VK_FALSE;
         hs.depth.stencilTestEnable = VK_FALSE;
-
         hs.depth.front.failOp = hs.depth.front.passOp = hs.depth.front.depthFailOp = VK_STENCIL_OP_KEEP;
         hs.depth.back.failOp = hs.depth.back.passOp = hs.depth.back.depthFailOp = VK_STENCIL_OP_KEEP;
         hs.depth.front.writeMask = 0;
         hs.depth.back.writeMask = 0;
-
         out.pDepthStencilState = &hs.depth;
-        // (no need to set modified here – depth lives in FS part)
+
+        modified |= kGplFS;
     }
 
-    // ------------------------------------------------------------------
-    // Fragment output – write only RGB of RT0 (unchanged)
-    // ------------------------------------------------------------------
-    if ((owned & kGplFO) && ci.pColorBlendState &&
+    // ----- Fragment output (only needed for colour) -----
+    if ((mode & HL_COLOR) && (owned & kGplFO) && ci.pColorBlendState &&
         ci.pColorBlendState->attachmentCount > 0 && ci.pColorBlendState->pAttachments)
     {
         hs.attachments.assign(ci.pColorBlendState->attachmentCount, VkPipelineColorBlendAttachmentState{});
@@ -348,7 +358,7 @@ static VkGraphicsPipelineLibraryFlagsEXT BuildHighlightCI(
             auto& att = hs.attachments[a];
             att.blendEnable = VK_FALSE;
             att.colorWriteMask = (a == 0)
-                ? (VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT)
+                ? (VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT) //changing this affects shader color
                 : 0;
         }
         hs.blend = *ci.pColorBlendState;
@@ -408,165 +418,15 @@ static VkGraphicsPipelineLibraryFlagsEXT BuildHighlightCI(
     return modified;
 }
 
+// ---------------------------------------------------------------------------
+// Add these two maps next to the existing g_highlightPipelines
+// ---------------------------------------------------------------------------
+std::unordered_map<VkPipeline, VkPipeline> g_highlightColor;   // colour only
+std::unordered_map<VkPipeline, VkPipeline> g_highlightWall;    // Wallwurst only
 
-/*
-// Builds the highlight create-info for whatever parts `owned` covers:
-//   fragment-shader part  -> fragment stage replaced by the flat-red shader
-//   fragment-output part  -> blending off; RT0 writes RGBA, other RTs write nothing
-// Returns the mask of parts that were really modified (kGplFS and/or kGplFO), 0 if none.
-static VkGraphicsPipelineLibraryFlagsEXT BuildHighlightCI(
-    const VkGraphicsPipelineCreateInfo& ci,
-    VkGraphicsPipelineLibraryFlagsEXT owned,
-    VkShaderModule red,
-    HighlightStorage& hs,
-    VkGraphicsPipelineCreateInfo& out)
-{
-    VkGraphicsPipelineLibraryFlagsEXT modified = 0;
-
-    out = ci;
-    out.flags &= ~(VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT |
-        VK_PIPELINE_CREATE_DERIVATIVE_BIT);
-    out.basePipelineHandle = VK_NULL_HANDLE;
-    out.basePipelineIndex = -1;
-
-    // ---- fragment shader: replace the fragment stage ----
-    if ((owned & kGplFS) && ci.pStages && ci.stageCount > 0 && red != VK_NULL_HANDLE)
-    {
-        hs.stages.assign(ci.pStages, ci.pStages + ci.stageCount);
-        for (auto& st : hs.stages)
-        {
-            if (st.stage == VK_SHADER_STAGE_FRAGMENT_BIT)
-            {
-                st.pNext = nullptr;
-                st.flags = 0;
-                st.module = red;
-                st.pName = "main";
-                st.pSpecializationInfo = nullptr;
-                modified |= kGplFS;
-            }
-        }
-        if (modified & kGplFS)
-            out.pStages = hs.stages.data();
-    }
-
-    //no
-    // ---- depth/stencil: the highlight is an OVERLAY drawn after the game's own draw ----
-    // The original draw already wrote depth, so the overlay must pass on equal depth,
-    // and must not write depth or stencil. 
-    if ((owned & kGplFS) && ci.pDepthStencilState)
-    {
-        hs.depth = *ci.pDepthStencilState;
-
-        static std::atomic<int> s_depthLogs{ 0 };
-        if (s_depthLogs.fetch_add(1) < 1)//10
-            Log("highlight depth: test=%d op=%d write=%d",
-                (int)ci.pDepthStencilState->depthTestEnable,
-                (int)ci.pDepthStencilState->depthCompareOp,
-                (int)ci.pDepthStencilState->depthWriteEnable);
-
-        // Keep the game's depth DIRECTION and only make the test inclusive (pass on equal).
-        // Unity on Vulkan uses reversed-Z (GREATER_OR_EQUAL), so forcing LESS_OR_EQUAL
-        // would pass for everything FARTHER than the stored depth, i.e. behind walls.
-        if (hs.depth.depthTestEnable)
-        {
-            if (hs.depth.depthCompareOp == VK_COMPARE_OP_LESS)
-                hs.depth.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
-            else if (hs.depth.depthCompareOp == VK_COMPARE_OP_GREATER)
-                hs.depth.depthCompareOp = VK_COMPARE_OP_GREATER_OR_EQUAL;
-            // LESS_OR_EQUAL / GREATER_OR_EQUAL / EQUAL / others stay exactly as the game has them
-        }
-        hs.depth.depthWriteEnable = VK_FALSE;
-
-        // Keep the game's stencil TEST (it may be what hides the model behind things),
-        // but make sure the overlay never changes stencil values.
-        hs.depth.front.failOp = hs.depth.front.passOp = hs.depth.front.depthFailOp = VK_STENCIL_OP_KEEP;
-        hs.depth.back.failOp = hs.depth.back.passOp = hs.depth.back.depthFailOp = VK_STENCIL_OP_KEEP;
-        hs.depth.front.writeMask = 0;
-        hs.depth.back.writeMask = 0;
-        out.pDepthStencilState = &hs.depth;
-    }    
-    
-    
-    //no
-    //ALTERNATIVE wallhack with VK_COMPARE_OP_ALWAYS, good for fps, BUT does not punch though all walls
-    // this is also for DOOM 2016
-    // ---- depth/stencil: make the highlight a true wallhack overlay ----
-    if ((owned & kGplFS) && ci.pDepthStencilState)
-    {
-        hs.depth = *ci.pDepthStencilState;
-
-        // Force always-pass + no depth write
-        hs.depth.depthTestEnable = VK_FALSE; //VK_TRUE;               // keep test enabled so the op is used
-        hs.depth.depthCompareOp = VK_COMPARE_OP_ALWAYS;  //
-        hs.depth.depthWriteEnable = VK_FALSE;
-
-        // Never touch stencil
-        hs.depth.front.failOp = hs.depth.front.passOp = hs.depth.front.depthFailOp = VK_STENCIL_OP_KEEP;
-        hs.depth.back.failOp = hs.depth.back.passOp = hs.depth.back.depthFailOp = VK_STENCIL_OP_KEEP;
-        hs.depth.front.writeMask = 0;
-        hs.depth.back.writeMask = 0;
-
-        out.pDepthStencilState = &hs.depth;
-    }
-    
-
-    
-    //same as above
-    if ((owned & kGplFS) && ci.pDepthStencilState)
-    {
-        hs.depth = *ci.pDepthStencilState;
-
-        // True wallhack / chams
-        hs.depth.depthTestEnable = VK_FALSE;
-        hs.depth.depthCompareOp = VK_COMPARE_OP_ALWAYS;
-        hs.depth.depthWriteEnable = VK_FALSE;
-
-        // Also kill the stencil test completely
-        hs.depth.stencilTestEnable = VK_FALSE;
-
-        // Safety: never modify stencil values even if something re-enables the test
-        hs.depth.front.failOp = hs.depth.front.passOp = hs.depth.front.depthFailOp = VK_STENCIL_OP_KEEP;
-        hs.depth.back.failOp = hs.depth.back.passOp = hs.depth.back.depthFailOp = VK_STENCIL_OP_KEEP;
-        hs.depth.front.writeMask = 0;
-        hs.depth.back.writeMask = 0;
-
-        out.pDepthStencilState = &hs.depth;
-
-        //static std::atomic<int> s_depthLogs{ 0 };
-        //if (s_depthLogs.fetch_add(1) < 1)
-            //Log("highlight depth forced: test=%d op=%d write=%d  stencilTest=%d",
-                //(int)hs.depth.depthTestEnable,(int)hs.depth.depthCompareOp,(int)hs.depth.depthWriteEnable,(int)hs.depth.stencilTestEnable);
-    }
-    
-
-    // ---- fragment output: overlay writes RGB of RT0 only ----
-    // Every other attachment (normals, motion vectors, masks, ...) and the alpha
-    // channel keep what the game's own draw wrote, so nothing is left with holes.
-    if ((owned & kGplFO) && ci.pColorBlendState &&
-        ci.pColorBlendState->attachmentCount > 0 && ci.pColorBlendState->pAttachments)
-    {
-        hs.attachments.assign(ci.pColorBlendState->attachmentCount, VkPipelineColorBlendAttachmentState{});
-        for (size_t a = 0; a < hs.attachments.size(); ++a)
-        {
-            VkPipelineColorBlendAttachmentState& att = hs.attachments[a];
-            att.blendEnable = VK_FALSE;
-            att.colorWriteMask = (a == 0)
-                ? (VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT)
-                : 0;
-        }
-
-        hs.blend = *ci.pColorBlendState;
-        hs.blend.logicOpEnable = VK_FALSE;
-        hs.blend.pAttachments = hs.attachments.data();
-        out.pColorBlendState = &hs.blend;
-        modified |= kGplFO;
-    }
-
-    return modified;
-}
-*/
-
-// ---- the detour -------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Full updated DetourVkCreateGraphicsPipelines
+// ---------------------------------------------------------------------------
 VKAPI_ATTR VkResult VKAPI_CALL DetourVkCreateGraphicsPipelines(
     VkDevice device,
     VkPipelineCache cache,
@@ -581,8 +441,6 @@ VKAPI_ATTR VkResult VKAPI_CALL DetourVkCreateGraphicsPipelines(
 
     // Create the original pipelines first
     VkResult r = pOriginalCreateGraphicsPipelines(device, cache, count, pCreateInfos, pAllocator, pPipelines);
-
-    // Partial results (e.g. VK_PIPELINE_COMPILE_REQUIRED) still leave valid handles.
     if (!pCreateInfos || !pPipelines || count == 0)
         return r;
 
@@ -592,8 +450,9 @@ VKAPI_ATTR VkResult VKAPI_CALL DetourVkCreateGraphicsPipelines(
         bool       isLibrary = false;
         uint32_t   stride = 0;
         uint64_t   key = 0;
-        VkPipeline highlight = VK_NULL_HANDLE;  // complete (non-library) highlight pipeline
-        LibInfo    lib;                         // filled when isLibrary
+        VkPipeline highlightColor = VK_NULL_HANDLE;   // colour only
+        VkPipeline highlightWall = VK_NULL_HANDLE;   // Wallwurst only
+        LibInfo    lib;
     };
 
     std::vector<Entry> entries;
@@ -605,7 +464,6 @@ VKAPI_ATTR VkResult VKAPI_CALL DetourVkCreateGraphicsPipelines(
             continue;
 
         const VkGraphicsPipelineCreateInfo& ci = pCreateInfos[i];
-
         Entry e;
         e.pipe = pPipelines[i];
 
@@ -613,13 +471,9 @@ VKAPI_ATTR VkResult VKAPI_CALL DetourVkCreateGraphicsPipelines(
         e.isLibrary = isLibrary;
 
         // ------------------------------------------------------------
-        // Dynamic-state flags (of this create info)
+        // Dynamic-state flags
         // ------------------------------------------------------------
-        bool strideDyn = false;
-        bool vinDyn = false;
-        bool depthDyn = false;
-        bool viewportDyn = false;
-
+        bool strideDyn = false, vinDyn = false, depthDyn = false, viewportDyn = false;
         if (ci.pDynamicState && ci.pDynamicState->pDynamicStates)
         {
             for (uint32_t d = 0; d < ci.pDynamicState->dynamicStateCount; ++d)
@@ -631,19 +485,16 @@ VKAPI_ATTR VkResult VKAPI_CALL DetourVkCreateGraphicsPipelines(
                     s == VK_DYNAMIC_STATE_DEPTH_COMPARE_OP || s == VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE ||
                     s == VK_DYNAMIC_STATE_STENCIL_OP)
                     depthDyn = true;
-
-                if (s == VK_DYNAMIC_STATE_VIEWPORT ||
-                    s == VK_DYNAMIC_STATE_VIEWPORT_WITH_COUNT)
+                if (s == VK_DYNAMIC_STATE_VIEWPORT || s == VK_DYNAMIC_STATE_VIEWPORT_WITH_COUNT)
                     viewportDyn = true;
             }
         }
 
         // ------------------------------------------------------------
-        // pNext chain: GPL part flags + linked libraries
+        // pNext chain
         // ------------------------------------------------------------
         const VkGraphicsPipelineLibraryCreateInfoEXT* gpl = nullptr;
         const VkPipelineLibraryCreateInfoKHR* li = nullptr;
-
         for (auto p = static_cast<const VkBaseInStructure*>(ci.pNext); p; p = p->pNext)
         {
             if (p->sType == VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_LIBRARY_CREATE_INFO_EXT)
@@ -651,35 +502,32 @@ VKAPI_ATTR VkResult VKAPI_CALL DetourVkCreateGraphicsPipelines(
             else if (p->sType == VK_STRUCTURE_TYPE_PIPELINE_LIBRARY_CREATE_INFO_KHR)
                 li = reinterpret_cast<const VkPipelineLibraryCreateInfoKHR*>(p);
         }
-
         const bool isLinked = li && li->libraryCount > 0 && li->pLibraries;
 
         // ------------------------------------------------------------
-        // Info from linked libraries (stride, key, parts, frag stage)
-        // and build the list with each library swapped for its highlight twin
+        // Linked libraries
         // ------------------------------------------------------------
         VkGraphicsPipelineLibraryFlagsEXT libParts = 0;
-        VkGraphicsPipelineLibraryFlagsEXT swappedParts = 0;   // FS/FO parts the twins really changed
+        VkGraphicsPipelineLibraryFlagsEXT swappedParts = 0;
         uint64_t libKey = 0;
         uint32_t libStride = 0;
         bool     libStrideUnknown = false;
         bool     libHasFrag = false;
         bool     swapped = false;
-        int      mTest = -1, mOp = -1, mWrite = -1, mStencil = -1;   // depth info from the FS library
+        int      mTest = -1, mOp = -1, mWrite = -1, mStencil = -1;
         bool     mDepthDyn = false;
+        bool     mViewportDyn = false;
         std::vector<VkPipeline> hlLibs;
 
         if (isLinked)
         {
             hlLibs.assign(li->pLibraries, li->pLibraries + li->libraryCount);
-
             std::lock_guard<std::mutex> lock(g_mtx);
             for (VkPipeline& lib : hlLibs)
             {
                 auto it = g_libInfo.find(lib);
                 if (it == g_libInfo.end())
-                    continue;   // library created before the hook was live
-
+                    continue;
                 const LibInfo& L = it->second;
                 libParts |= L.parts;
                 libKey = combine(libKey, L.key);
@@ -691,13 +539,13 @@ VKAPI_ATTR VkResult VKAPI_CALL DetourVkCreateGraphicsPipelines(
                     mWrite = L.depthWrite; mStencil = L.stencilTest;
                     mDepthDyn = L.depthDyn;
                 }
-
+                if (L.parts & kGplPre)
+                    mViewportDyn |= L.viewportDyn;
                 if (L.parts & kGplVI)
                 {
                     libStride = L.stride;
                     libStrideUnknown = L.strideUnknown;
                 }
-
                 if (L.highlightLib != VK_NULL_HANDLE && L.twinParts != 0)
                 {
                     lib = L.highlightLib;
@@ -707,12 +555,10 @@ VKAPI_ATTR VkResult VKAPI_CALL DetourVkCreateGraphicsPipelines(
             }
         }
 
-        // Which parts does THIS create info actually own?
-        // State for parts it doesn't own is ignored (and may be null/junk).
         VkGraphicsPipelineLibraryFlagsEXT owned;
         if (gpl)            owned = gpl->flags;
         else if (isLinked)  owned = libParts ? (kGplAll & ~libParts) : 0;
-        else                owned = kGplAll;   // classic monolithic pipeline
+        else                owned = kGplAll;
 
         const bool ownsVI = (owned & kGplVI) != 0;
         const bool ownsPre = (owned & kGplPre) != 0;
@@ -720,19 +566,17 @@ VKAPI_ATTR VkResult VKAPI_CALL DetourVkCreateGraphicsPipelines(
         const bool ownsFO = (owned & kGplFO) != 0;
 
         // ------------------------------------------------------------
-        // Stride (only from the vertex-input part)
+        // Stride
         // ------------------------------------------------------------
         const VkPipelineVertexInputStateCreateInfo* vis =
             (ownsVI && !vinDyn) ? ci.pVertexInputState : nullptr;
 
         uint32_t ownStride = 0;
-        if (!strideDyn && vis &&
-            vis->pVertexBindingDescriptions && vis->vertexBindingDescriptionCount > 0)
+        if (!strideDyn && vis && vis->pVertexBindingDescriptions && vis->vertexBindingDescriptionCount > 0)
         {
             uint32_t primary = vis->pVertexBindingDescriptions[0].binding;
             if (vis->pVertexAttributeDescriptions && vis->vertexAttributeDescriptionCount > 0)
                 primary = vis->pVertexAttributeDescriptions[0].binding;
-
             for (uint32_t b = 0; b < vis->vertexBindingDescriptionCount; ++b)
             {
                 if (vis->pVertexBindingDescriptions[b].binding == primary)
@@ -742,13 +586,12 @@ VKAPI_ATTR VkResult VKAPI_CALL DetourVkCreateGraphicsPipelines(
                 }
             }
         }
-
         const uint32_t stride = ownsVI ? ownStride : libStride;
         const bool strideUnknown = ownsVI ? (vinDyn || strideDyn) : libStrideUnknown;
         e.stride = stride;
 
         // ------------------------------------------------------------
-        // Key (own state only, then combined with the libraries' keys)
+        // Key (unchanged from your original)
         // ------------------------------------------------------------
         uint64_t key = 0;
         bool ownHasFrag = false;
@@ -861,22 +704,18 @@ VKAPI_ATTR VkResult VKAPI_CALL DetourVkCreateGraphicsPipelines(
                 key = combine(key, att.blendEnable ? 1ull : 0ull);
                 key = combine(key, att.colorWriteMask);
             }
-        } 
+        }
 
-
-        // Linked pipelines: fold in the libraries' keys (a linked final has no stages / vertex input of its own, so without this all finals collide).
+        // rest of your key calculation (vertex input, raster, depth, blend, linked) …
         if (isLinked)
             key = combine(key, libKey);
-
         if (key == 0)
             key = combine(key, 0xDEADBEEFCAFEBABEull);
-
         e.key = key;
 
         const bool hasFrag = ownHasFrag || libHasFrag;
 
-        // depth/stencil setup (own if this create info owns the FS part, else from the linked FS library)
-        int dTest = mTest, dOp = mOp, dWrite = mWrite, dStencil = mStencil;
+        int  dTest = mTest, dOp = mOp, dWrite = mWrite, dStencil = mStencil;
         bool dDyn = mDepthDyn;
         if (ownsFS && ci.pDepthStencilState)
         {
@@ -886,10 +725,8 @@ VKAPI_ATTR VkResult VKAPI_CALL DetourVkCreateGraphicsPipelines(
             dStencil = ci.pDepthStencilState->stencilTestEnable ? 1 : 0;
             dDyn = depthDyn;
         }
+        bool vDyn = mViewportDyn || viewportDyn;
 
-        // Does this fragment-shader part really reject hidden pixels? A pass with depth test
-        // off / ALWAYS draws through everything, so an overlay on it would be visible through
-        // walls. Dynamic depth state can't be judged here, so it is allowed.
         const bool realDepthTest =
             depthDyn ||
             (ci.pDepthStencilState && ci.pDepthStencilState->depthTestEnable &&
@@ -897,129 +734,53 @@ VKAPI_ATTR VkResult VKAPI_CALL DetourVkCreateGraphicsPipelines(
                 ci.pDepthStencilState->depthCompareOp != VK_COMPARE_OP_NEVER &&
                 ci.pDepthStencilState->depthCompareOp != VK_COMPARE_OP_NOT_EQUAL);
 
-        static std::atomic<int> s_infoLogs{ 0 };
-        if (s_infoLogs.fetch_add(1) < 1)
-            Log("GP pipe=%p kind=%s flags=0x%x owned=0x%x libParts=0x%x stride=%u strideUnknown=%d "
-                "vinDyn=%d strideDyn=%d frag=%d att=%u key=%llu",
-                (void*)e.pipe,
-                isLibrary ? (isLinked ? "linked-lib" : "lib") : (isLinked ? "linked" : "full"),
-                (unsigned)ci.flags, (unsigned)owned, (unsigned)libParts,
-                stride, strideUnknown ? 1 : 0, vinDyn ? 1 : 0, strideDyn ? 1 : 0,
-                hasFrag ? 1 : 0,
-                (ownsFO && ci.pColorBlendState) ? ci.pColorBlendState->attachmentCount : 0u,
-                (unsigned long long)key);
+        const bool strideWanted = (stride >= 1) || strideUnknown;
 
         // ------------------------------------------------------------
-        // Highlight creation (flat-red fragment shader, blending off)
+        // Create the two highlight pipelines
         // ------------------------------------------------------------
-        VkPipeline highlightPipe = VK_NULL_HANDLE;
-        VkResult   hr = VK_SUCCESS;
-        bool       attempted = false;
-        VkGraphicsPipelineLibraryFlagsEXT twinParts = 0;
-        //Log("1");
-        //const bool strideWanted = true;
-        const bool strideWanted = (stride >= 1) || strideUnknown; //<--- stride >= 1 better to use the models stride like 40, but need to bruteforce this first in drawindexed
-        //Log("2");
-
-        //Log("isLinked == %d && ownsFS == %d && realDepthTest == %d && isLibrary == %d && ownsFO == %d && hasFrag == %d",
-            //isLinked, ownsFS, realDepthTest, isLibrary, ownsFO, hasFrag);
-
-        if (!isLinked && (!ownsFS || realDepthTest) && (isLibrary ? (ownsFS || ownsFO) : (hasFrag && strideWanted)))
-        //if (!isLinked && (isLibrary ? (ownsFS || ownsFO) : (hasFrag && strideWanted)))
+        if (!isLinked && (!ownsFS || realDepthTest) &&
+            (isLibrary ? (ownsFS || ownsFO) : (hasFrag && strideWanted)))
         {
-            //Log("3");
-
-            //Log("3a – calling GetRedFragModule");
             VkShaderModule red = ownsFS ? GetRedFragModule(device) : VK_NULL_HANDLE;
-            //Log("3b – red = %p", (void*)red);
 
-            //Log("3c – calling BuildHighlightCI");
-            HighlightStorage hs;
-            VkGraphicsPipelineCreateInfo hci;
-            twinParts = BuildHighlightCI(ci, owned, red, hs, hci);
-            //Log("3d – twinParts = 0x%x", (unsigned)twinParts);
-
-            const bool complete = isLibrary
-                ? (twinParts != 0)
-                : ((twinParts & (kGplFS | kGplFO)) == (kGplFS | kGplFO));
-            //Log("3e – complete = %d", (int)complete);
-
-            if (complete)
+            // ---- 1) Colour-only pipeline ----
             {
-                //Log("3f – calling CreateGraphicsPipelines for highlight");
-                attempted = true;
-                hr = pOriginalCreateGraphicsPipelines(device, cache, 1, &hci, pAllocator, &highlightPipe);
-                //Log("3g – hr = %d  highlight = %p", (int)hr, (void*)highlightPipe);
-            }
-            //Log("3h – finished");
-        }
+                HighlightStorage hs;
+                VkGraphicsPipelineCreateInfo hci;
+                auto parts = BuildHighlightCI(ci, owned, red, hs, hci, HL_COLOR);
 
-        else if (isLinked && swapped && !ownsFS && !ownsFO &&
-            (isLibrary || (hasFrag && strideWanted &&
-                (swappedParts & (kGplFS | kGplFO)) == (kGplFS | kGplFO))))
-        {
-            //Log("4");
-            // Safe copy – never mutate the application's create-info
-            VkGraphicsPipelineCreateInfo hci = ci;
-            hci.flags &= ~(VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT |
-                VK_PIPELINE_CREATE_DERIVATIVE_BIT);
-            hci.basePipelineHandle = VK_NULL_HANDLE;
-            hci.basePipelineIndex = -1;
+                const bool complete = isLibrary
+                    ? (parts != 0)
+                    : ((parts & (kGplFS | kGplFO)) == (kGplFS | kGplFO));
 
-            // Local copy of the library info
-            VkPipelineLibraryCreateInfoKHR localLib = *li;
-            localLib.pLibraries = hlLibs.data();          // our vector stays alive for the call
-
-            // Re-wire pNext so the local lib info is used
-            // (simple case – assumes li is directly in the pNext chain)
-            // For a more robust version you can rebuild the whole pNext chain,
-            // but this is enough for the common case.
-            hci.pNext = &localLib;
-
-            // If the original pNext contained more structures you care about,
-            // you would need to copy them too. For most games the library info
-            // is the only relevant one here.
-
-            attempted = true;
-            twinParts = swappedParts;
-            hr = pOriginalCreateGraphicsPipelines(device, cache, 1, &hci, pAllocator, &highlightPipe);
-        }
-
-        //Log("5");
-        if (attempted)
-        {
-            //Log("6");
-            if (hr == VK_SUCCESS && highlightPipe != VK_NULL_HANDLE)
-            {
-                //Log("7");
-                if (isLibrary)
+                if (complete)
                 {
-                    e.lib.highlightLib = highlightPipe;
-                    e.lib.twinParts = twinParts;
+                    VkPipeline pipe = VK_NULL_HANDLE;
+                    if (pOriginalCreateGraphicsPipelines(device, cache, 1, &hci, pAllocator, &pipe) == VK_SUCCESS)
+                        e.highlightColor = pipe;
                 }
-                else
-                {
-                    e.highlight = highlightPipe;
-
-                    static std::atomic<int> s_modelLogs{ 0 };
-                    if (s_modelLogs.fetch_add(1) < 1)
-                        Log("HL model pipe=%p stride=%u strideUnknown=%d depthTest=%d op=%d write=%d "
-                            "stencil=%d depthDynamic=%d",
-                            (void*)e.pipe, stride, strideUnknown ? 1 : 0,
-                            dTest, dOp, dWrite, dStencil, dDyn ? 1 : 0);
-                }
-
-                if (kVerboseKeyLog)
-                    Log("CreateGP: created highlight %p for original %p", (void*)highlightPipe, (void*)e.pipe);
             }
-            else
+
+            // ---- 2) Wallwurst-only pipeline (depth off, keep original shader) ----
             {
-                static std::atomic<int> s_failLogs{ 0 };
-                if (s_failLogs.fetch_add(1) < 20)
-                    Log("highlight create FAILED hr=%d for %p (kind=%s)", (int)hr, (void*)e.pipe,
-                        isLibrary ? "lib" : (isLinked ? "linked" : "full"));
+                HighlightStorage hs;
+                VkGraphicsPipelineCreateInfo hci;
+                auto parts = BuildHighlightCI(ci, owned, VK_NULL_HANDLE, hs, hci, HL_Wallwurst);
+
+                const bool complete = isLibrary
+                    ? (parts != 0)
+                    : (parts != 0);   // Wallwurst only needs the FS depth change
+
+                if (complete)
+                {
+                    VkPipeline pipe = VK_NULL_HANDLE;
+                    if (pOriginalCreateGraphicsPipelines(device, cache, 1, &hci, pAllocator, &pipe) == VK_SUCCESS)
+                        e.highlightWall = pipe;
+                }
             }
         }
+        // (linked-library path can stay as-is or be extended later the same way)
 
         // Library bookkeeping
         if (isLibrary)
@@ -1029,17 +790,21 @@ VKAPI_ATTR VkResult VKAPI_CALL DetourVkCreateGraphicsPipelines(
             e.lib.strideUnknown = strideUnknown;
             e.lib.hasFrag = hasFrag;
             e.lib.key = key;
-            e.lib.depthTest = dTest;   e.lib.depthOp = dOp;
-            e.lib.depthWrite = dWrite; e.lib.stencilTest = dStencil;
+            e.lib.depthTest = dTest;
+            e.lib.depthOp = dOp;
+            e.lib.depthWrite = dWrite;
+            e.lib.stencilTest = dStencil;
             e.lib.depthDyn = dDyn;
-            e.lib.viewportDyn = viewportDyn;
+            e.lib.viewportDyn = vDyn;
+            // for libraries we still store only one twin for now
+            e.lib.highlightLib = e.highlightColor ? e.highlightColor : e.highlightWall;
         }
 
         entries.push_back(e);
     }
 
     // ------------------------------------------------------------
-    // ONE short lock, map writes only
+    // Write maps
     // ------------------------------------------------------------
     {
         std::lock_guard<std::mutex> lock(g_mtx);
@@ -1048,23 +813,26 @@ VKAPI_ATTR VkResult VKAPI_CALL DetourVkCreateGraphicsPipelines(
             if (e.isLibrary)
             {
                 g_libInfo[e.pipe] = e.lib;
-
-                // handle may have been reused from a former complete pipeline
                 g_pipelineStrides.erase(e.pipe);
                 g_pipelineKey.erase(e.pipe);
-                g_highlightPipelines.erase(e.pipe);
+                g_highlightColor.erase(e.pipe);
+                g_highlightWall.erase(e.pipe);
             }
             else
             {
                 g_libInfo.erase(e.pipe);
-
                 g_pipelineStrides[e.pipe] = e.stride;
                 g_pipelineKey[e.pipe] = e.key;
 
-                if (e.highlight != VK_NULL_HANDLE)
-                    g_highlightPipelines[e.pipe] = e.highlight;
+                if (e.highlightColor != VK_NULL_HANDLE)
+                    g_highlightColor[e.pipe] = e.highlightColor;
                 else
-                    g_highlightPipelines.erase(e.pipe);   // never keep a stale clone
+                    g_highlightColor.erase(e.pipe);
+
+                if (e.highlightWall != VK_NULL_HANDLE)
+                    g_highlightWall[e.pipe] = e.highlightWall;
+                else
+                    g_highlightWall.erase(e.pipe);
             }
         }
     }
@@ -1196,57 +964,77 @@ void VKAPI_CALL DetourVkCmdDrawIndexed(VkCommandBuffer cmd, uint32_t idxCount, u
         Log("DetourVkCmdDrawIndexed");
         loggedOnce = true;
     }
-    
+
     VkPipeline original = VK_NULL_HANDLE;
-    VkPipeline highlight = VK_NULL_HANDLE;
+    VkPipeline highlightColor = VK_NULL_HANDLE;
+    VkPipeline highlightWall = VK_NULL_HANDLE;
     uint32_t   dstride = 0;
     uint32_t   pstride = 0;
     uint64_t   key = 0;
-
     {
         std::lock_guard<std::mutex> lock(g_mtx);
+
         auto pit = g_curPipeline.find(cmd);
         if (pit != g_curPipeline.end())
         {
             original = pit->second;
-            auto hit = g_highlightPipelines.find(original);
-            if (hit != g_highlightPipelines.end())
-                highlight = hit->second;
+
+            auto itC = g_highlightColor.find(original);
+            if (itC != g_highlightColor.end())
+                highlightColor = itC->second;
+
+            auto itW = g_highlightWall.find(original);
+            if (itW != g_highlightWall.end())
+                highlightWall = itW->second;
+
             auto pst = g_pipelineStrides.find(original);
             if (pst != g_pipelineStrides.end())
                 pstride = pst->second;
         }
+
         auto sit = g_cmdBufStride.find(cmd);
         if (sit != g_cmdBufStride.end())
             dstride = sit->second;
+
         auto kit = g_curKey.find(cmd);
         if (kit != g_curKey.end())
             key = kit->second;
     }
-    const uint32_t stride = dstride ? dstride : pstride; //model recognition option 1
-    const uint32_t shortkey = static_cast<uint32_t>(key % 100); //model recognition option 2
 
+    const uint32_t stride = dstride ? dstride : pstride;
+    const uint32_t shortkey = static_cast<uint32_t>(key % 100);
 
-    // Bruteforce stride (By pressing the keys period(.) and comma(,), minus(-) will reset it -1 again.
-    //if (shortkey == countstride)
-    //if(logvalues) //press F5 to log, press F5 again to stop logging
-        //Log("stride == %d && dstride == %d && pstride == %d && shortkey == %d && idxCount == %d", stride, dstride, pstride, shortkey, idxCount);
-
-
-    // Model recognition
-    //if (stride != countstride) //countride = 40 by default, 40 = valheim, 48 = zombie army 4: dead war(reversedDepth=true), 28,56? = deadlock
+    if (logvalues)
+        Log("stride == %d && dstride == %d && pstride == %d && shortkey == %d && idxCount == %d",
+            stride, dstride, pstride, shortkey, idxCount);
+   
+    // Model recognition – Wolfenstein II
+    if (stride != countstride) //countride = 40 by default, 40 = valheim, 48 = zombie army 4: dead war(reversedDepth=true), 28,56? = deadlock
     //if (stride != 28 && stride != 56) //+44? deadlock
     //if (stride != 48) //zomby army 4
     //if (shortkey != 10) //doom 2016
-    if (shortkey != 64) //wolfenstein II: the new colossus
-    //if (stride != 40)
+    //if (shortkey != 64)          // change this for other games
     {
         if (pOriginalCmdDrawIndexed)
             pOriginalCmdDrawIndexed(cmd, idxCount, instCount, firstIdx, vtxOff, firstInst);
         return;
     }
 
+    /*
+    if (shortkey == 64)
+    {
+        static int n = 0;
+        if (n++ < 20)
+            Log("MATCH shortkey=64 wall=%d color=%d hlW=%p hlC=%p orig=%p key=%llu",
+                (int)Wallwurst.load(), (int)colorhack.load(),
+                (void*)highlightWall, (void*)highlightColor,
+                (void*)original, (unsigned long long)key);
+    }
+    */
+
+    // ------------------------------------------------------------------
     // Capture viewport
+    // ------------------------------------------------------------------
     bool hasVp = false;
     CmdState localState{};
     {
@@ -1259,57 +1047,113 @@ void VKAPI_CALL DetourVkCmdDrawIndexed(VkCommandBuffer cmd, uint32_t idxCount, u
         }
     }
 
-    
-    bool wantColor = (original != VK_NULL_HANDLE && highlight != VK_NULL_HANDLE);
-    bool wantWall = hasVp;
+    bool wantColor = colorhack && (highlightColor != VK_NULL_HANDLE);
+    bool wantWall = Wallwurst && (highlightWall != VK_NULL_HANDLE);
 
-    if (!wallhack)  wantWall = false;
-    if (!colorhack) wantColor = false;
-
-    // ------------------------------------------------------------------
-    // 1) Normal draw – keeps depth buffer correct for the rest of the frame
-    // ------------------------------------------------------------------
+    // 1) normal draw
     if (pOriginalCmdDrawIndexed)
         pOriginalCmdDrawIndexed(cmd, idxCount, instCount, firstIdx, vtxOff, firstInst);
 
-    // ------------------------------------------------------------------
-    // 2) + 3) Wallhack solid + Colour  (both use modified viewport)
-    // ------------------------------------------------------------------
     if (wantWall || wantColor)
     {
-        // Apply wallhack viewport once for the remaining passes
-        if (wantWall && pOriginalCmdSetViewport)
+        // 1. Wallwurst pass
+        if (wantWall)
         {
-            VkViewport hVp = localState.currentViewport;
-            constexpr bool reversedDepth = false;   // set true if game uses reversed-Z (zombie army 4)
-            hVp.minDepth = reversedDepth ? 0.0f : 0.9f;
-            hVp.maxDepth = reversedDepth ? 0.1f : 1.0f;
-            pOriginalCmdSetViewport(cmd, localState.firstViewport, 1, &hVp);
+            if (pOriginalCmdSetViewport && hasVp)
+            {
+                VkViewport hVp = localState.currentViewport;
+                //hVp.minDepth = 0.0f;
+                //hVp.maxDepth = 0.05f;
+                constexpr bool reversedDepth = false;   // set true if game uses reversed-Z (zombie army 4)
+                hVp.minDepth = reversedDepth ? 0.0f : 0.9f;
+                hVp.maxDepth = reversedDepth ? 0.1f : 1.0f;
+
+                pOriginalCmdSetViewport(cmd, 0, 1, &hVp);
+            }
+
+            if (pOriginalCmdBindPipeline)
+                pOriginalCmdBindPipeline(
+                    cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, highlightWall);
+
+            if (pOriginalCmdDrawIndexed)
+                pOriginalCmdDrawIndexed(
+                    cmd, idxCount, instCount, firstIdx, vtxOff, firstInst);
+
+            // Restore the original viewport
+            if (pOriginalCmdSetViewport && hasVp)
+                pOriginalCmdSetViewport(
+                    cmd, localState.firstViewport, 1,
+                    &localState.currentViewport);
         }
 
-        // 2) Solid wallhack pass
-        if (wantWall && pOriginalCmdDrawIndexed)
-            pOriginalCmdDrawIndexed(cmd, idxCount, instCount, firstIdx, vtxOff, firstInst);
-
-        // 3) Colour pass 
+        // 2. Color pass (independent of Wallwurst)
         if (wantColor)
         {
             if (pOriginalCmdBindPipeline)
-                pOriginalCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, highlight);
+                pOriginalCmdBindPipeline(
+                    cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, highlightColor);
 
             if (pOriginalCmdDrawIndexed)
-                pOriginalCmdDrawIndexed(cmd, idxCount, instCount, firstIdx, vtxOff, firstInst);
-
-            if (pOriginalCmdBindPipeline)
-                pOriginalCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, original);
+                pOriginalCmdDrawIndexed(
+                    cmd, idxCount, instCount, firstIdx, vtxOff, firstInst);
         }
 
-        // Restore original viewport
-        if (wantWall && pOriginalCmdSetViewport)
-            pOriginalCmdSetViewport(cmd, localState.firstViewport, 1, &localState.currentViewport);
+        // 3. Restore original pipeline
+        if (pOriginalCmdBindPipeline && original != VK_NULL_HANDLE)
+            pOriginalCmdBindPipeline(
+                cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, original);
     }
-    
-    //return pOriginalCmdDrawIndexed(cmd, idxCount, instCount, firstIdx, vtxOff, firstInst);
+
+
+    /*
+    //chams
+    if (wantWall || wantColor)
+    {
+        // 1. Wallwurst pass
+        if (wantWall)
+        {
+            if (pOriginalCmdSetViewport && hasVp)
+            {
+                VkViewport hVp = localState.currentViewport;
+                hVp.minDepth = 0.0f;
+                hVp.maxDepth = 0.05f;
+
+                pOriginalCmdSetViewport(cmd, 0, 1, &hVp);
+            }
+
+            if (pOriginalCmdBindPipeline)
+                pOriginalCmdBindPipeline(
+                    cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, highlightWall);
+
+            if (pOriginalCmdDrawIndexed)
+                pOriginalCmdDrawIndexed(
+                    cmd, idxCount, instCount, firstIdx, vtxOff, firstInst);
+
+            // Restore the original viewport
+            if (pOriginalCmdSetViewport && hasVp)
+                pOriginalCmdSetViewport(
+                    cmd, localState.firstViewport, 1,
+                    &localState.currentViewport);
+        }
+
+        // 2. Color pass (independent of Wallwurst)
+        if (wantColor)
+        {
+            if (pOriginalCmdBindPipeline)
+                pOriginalCmdBindPipeline(
+                    cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, highlightColor);
+
+            if (pOriginalCmdDrawIndexed)
+                pOriginalCmdDrawIndexed(
+                    cmd, idxCount, instCount, firstIdx, vtxOff, firstInst);
+        }
+
+        // 3. Restore original pipeline
+        if (pOriginalCmdBindPipeline && original != VK_NULL_HANDLE)
+            pOriginalCmdBindPipeline(
+                cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, original);
+    }
+    */
 }
 
 //===================================================================================================//
@@ -1321,119 +1165,9 @@ void VKAPI_CALL DetourVkCmdDrawIndexedIndirect(VkCommandBuffer cmd, VkBuffer buf
         Log("DetourVkCmdDrawIndexedIndirect");
         loggedOnce = true;
     }
-    /*
+    
     //if game is drawing models in DrawIndexedIndirect, paste code from DrawIndexed here
-    VkPipeline original = VK_NULL_HANDLE;
-    VkPipeline highlight = VK_NULL_HANDLE;
-    uint32_t   dstride = 0;
-    uint32_t   pstride = 0;
-    uint64_t   key = 0;
-
-    {
-        std::lock_guard<std::mutex> lock(g_mtx);
-        auto pit = g_curPipeline.find(cmd);
-        if (pit != g_curPipeline.end())
-        {
-            original = pit->second;
-            auto hit = g_highlightPipelines.find(original);
-            if (hit != g_highlightPipelines.end())
-                highlight = hit->second;
-            auto pst = g_pipelineStrides.find(original);
-            if (pst != g_pipelineStrides.end())
-                pstride = pst->second;
-        }
-        auto sit = g_cmdBufStride.find(cmd);
-        if (sit != g_cmdBufStride.end())
-            dstride = sit->second;
-        auto kit = g_curKey.find(cmd);
-        if (kit != g_curKey.end())
-            key = kit->second;
-    }
-    const uint32_t stride = dstride ? dstride : pstride; //model recognition option 1
-    const uint32_t shortkey = static_cast<uint32_t>(key % 100); //model recognition option 2
-
-
-    // Bruteforce stride (By pressing the keys period(.) and comma(,), minus(-) will reset it -1 again.
-    if (stride == countstride)
-    if(logvalues) //press F5 to log, press F5 again to stop logging
-        Log("stride == %d && dstride == %d && pstride == %d && shortkey == %d", stride, dstride, pstride, shortkey);
-
-
-    // Model recognition
-    if (stride != countstride) //countride = 40 by default, 40 = valheim, 48 = zombie army 4: dead war(reversedDepth=true), 28,56? = deadlock
-    //if (stride != 28 && stride != 56) //+44? deadlock
-    //if (stride != 48) //zomby army 4
-    //if(shortkey != 10)//doom 2016
-    //if (shortkey != countstride)
-    {
-        if (pOriginalCmdDrawIndexed)
-            pOriginalCmdDrawIndexedIndirect(cmd, buffer, offset, drawCount, istride);
-        return;
-    }
-
-    // Capture viewport
-    bool hasVp = false;
-    CmdState localState{};
-    {
-        std::shared_lock<std::shared_mutex> lock(statesMtx);
-        auto it = cmdStates.find(cmd);
-        if (it != cmdStates.end() && it->second.hasViewport)
-        {
-            localState = it->second;
-            hasVp = true;
-        }
-    }
-
-
-    bool wantColor = (original != VK_NULL_HANDLE && highlight != VK_NULL_HANDLE);
-    bool wantWall = hasVp;
-
-    if (!wallhack)  wantWall = false;
-    if (!colorhack) wantColor = false;
-
-    // ------------------------------------------------------------------
-    // 1) Normal draw – keeps depth buffer correct for the rest of the frame
-    // ------------------------------------------------------------------
-    if (pOriginalCmdDrawIndexed)
-        pOriginalCmdDrawIndexedIndirect(cmd, buffer, offset, drawCount, istride);
-
-    // ------------------------------------------------------------------
-    // 2) + 3) Wallhack solid + Colour  (both use modified viewport)
-    // ------------------------------------------------------------------
-    if (wantWall || wantColor)
-    {
-        // Apply wallhack viewport once for the remaining passes
-        if (wantWall && pOriginalCmdSetViewport)
-        {
-            VkViewport hVp = localState.currentViewport;
-            constexpr bool reversedDepth = false;   // set true if game uses reversed-Z (zombie army 4)
-            hVp.minDepth = reversedDepth ? 0.0f : 0.9f;
-            hVp.maxDepth = reversedDepth ? 0.1f : 1.0f;
-            pOriginalCmdSetViewport(cmd, localState.firstViewport, 1, &hVp);
-        }
-
-        // 2) Solid wallhack pass
-        if (wantWall && pOriginalCmdDrawIndexed)
-            pOriginalCmdDrawIndexedIndirect(cmd, buffer, offset, drawCount, istride);
-
-        // 3) Colour pass 
-        if (wantColor)
-        {
-            if (pOriginalCmdBindPipeline)
-                pOriginalCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, highlight);
-
-            if (pOriginalCmdDrawIndexed)
-                pOriginalCmdDrawIndexedIndirect(cmd, buffer, offset, drawCount, istride);
-
-            if (pOriginalCmdBindPipeline)
-                pOriginalCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, original);
-        }
-
-        // Restore original viewport
-        if (wantWall && pOriginalCmdSetViewport)
-            pOriginalCmdSetViewport(cmd, localState.firstViewport, 1, &localState.currentViewport);
-    }
-    */
+    
     //return pOriginalCmdDrawIndexedIndirect(cmd, buffer, offset, drawCount, istride);
 }
 
@@ -1780,7 +1514,7 @@ DWORD WINAPI InputThread(LPVOID lpParam) {
         bool c2 = GetAsyncKeyState(VK_F4) & 0x8000;
         bool c3 = GetAsyncKeyState(VK_F5) & 0x8000;
 
-        if (c1 && !p1) wallhack = !wallhack;   
+        if (c1 && !p1) Wallwurst = !Wallwurst;   
         if (c2 && !p2) colorhack = !colorhack;
         if (c3 && !p3) logvalues = !logvalues;
 
