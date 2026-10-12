@@ -291,10 +291,14 @@ struct HighlightStorage
 enum HighlightMode : uint32_t
 {
     HL_NONE = 0,
-    HL_COLOR = 1 << 0,   // replace fragment shader + FO blend
-    HL_Wallwurst = 1 << 1,   // force depth off / ALWAYS
+    HL_COLOR = 1 << 0,   // red fragment shader + FO blend
+    HL_Wallwurst = 1 << 1,   // depth test off / ALWAYS
+    // both = HL_COLOR | HL_Wallwurst
 };
 
+std::unordered_map<VkPipeline, VkPipeline> g_highlightColor;  // colour only
+std::unordered_map<VkPipeline, VkPipeline> g_highlightWall;   // wallhack only
+std::unordered_map<VkPipeline, VkPipeline> g_highlightBoth;   // colour + wallhack
 
 static VkGraphicsPipelineLibraryFlagsEXT BuildHighlightCI(
     const VkGraphicsPipelineCreateInfo& ci,
@@ -302,7 +306,7 @@ static VkGraphicsPipelineLibraryFlagsEXT BuildHighlightCI(
     VkShaderModule red,
     HighlightStorage& hs,
     VkGraphicsPipelineCreateInfo& out,
-    uint32_t mode)                     // <-- new parameter
+    uint32_t mode)
 {
     VkGraphicsPipelineLibraryFlagsEXT modified = 0;
     out = ci;
@@ -311,7 +315,7 @@ static VkGraphicsPipelineLibraryFlagsEXT BuildHighlightCI(
     out.basePipelineHandle = VK_NULL_HANDLE;
     out.basePipelineIndex = -1;
 
-    // ----- Colour -----
+    // ----- Colour: replace fragment shader -----
     if ((mode & HL_COLOR) && (owned & kGplFS) && ci.pStages && ci.stageCount > 0 && red)
     {
         hs.stages.assign(ci.pStages, ci.pStages + ci.stageCount);
@@ -331,7 +335,7 @@ static VkGraphicsPipelineLibraryFlagsEXT BuildHighlightCI(
             out.pStages = hs.stages.data();
     }
 
-    // ----- Wallwurst (depth off) -----
+    // ----- Wallhack: force depth off -----
     if ((mode & HL_Wallwurst) && (owned & kGplFS) && ci.pDepthStencilState)
     {
         hs.depth = *ci.pDepthStencilState;
@@ -344,11 +348,10 @@ static VkGraphicsPipelineLibraryFlagsEXT BuildHighlightCI(
         hs.depth.front.writeMask = 0;
         hs.depth.back.writeMask = 0;
         out.pDepthStencilState = &hs.depth;
-
-        modified |= kGplFS;
+        modified |= kGplFS;   // required so creation does not skip this pipeline
     }
 
-    // ----- Fragment output (only needed for colour) -----
+    // ----- Fragment output (colour only / both) -----
     if ((mode & HL_COLOR) && (owned & kGplFO) && ci.pColorBlendState &&
         ci.pColorBlendState->attachmentCount > 0 && ci.pColorBlendState->pAttachments)
     {
@@ -358,7 +361,7 @@ static VkGraphicsPipelineLibraryFlagsEXT BuildHighlightCI(
             auto& att = hs.attachments[a];
             att.blendEnable = VK_FALSE;
             att.colorWriteMask = (a == 0)
-                ? (VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT) //changing this affects shader color
+                ? (VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT)
                 : 0;
         }
         hs.blend = *ci.pColorBlendState;
@@ -368,15 +371,9 @@ static VkGraphicsPipelineLibraryFlagsEXT BuildHighlightCI(
         modified |= kGplFO;
     }
 
-    // ------------------------------------------------------------------
-    // NEW: Force dynamic viewport
-    // ------------------------------------------------------------------
-    // We always make viewport dynamic on the highlight so that the
-    // later vkCmdSetViewport / vkCmdSetViewportWithCount calls actually work.
+    // ----- Force dynamic viewport -----
     {
         hs.dynStates.clear();
-
-        // Copy existing dynamic states (if any)
         if (ci.pDynamicState && ci.pDynamicState->pDynamicStates &&
             ci.pDynamicState->dynamicStateCount > 0)
         {
@@ -385,44 +382,25 @@ static VkGraphicsPipelineLibraryFlagsEXT BuildHighlightCI(
                 ci.pDynamicState->pDynamicStates + ci.pDynamicState->dynamicStateCount);
         }
 
-        // Check whether viewport is already dynamic
-        bool hasViewport = false;
-        bool hasViewportWithCount = false;
+        bool hasViewport = false, hasViewportWithCount = false;
         for (VkDynamicState s : hs.dynStates)
         {
-            if (s == VK_DYNAMIC_STATE_VIEWPORT)
-                hasViewport = true;
-            if (s == VK_DYNAMIC_STATE_VIEWPORT_WITH_COUNT)
-                hasViewportWithCount = true;
+            if (s == VK_DYNAMIC_STATE_VIEWPORT)            hasViewport = true;
+            if (s == VK_DYNAMIC_STATE_VIEWPORT_WITH_COUNT) hasViewportWithCount = true;
         }
-
-        // Prefer the variant the game is actually using.
-        // Most idTech titles use the classic VIEWPORT, but some use WITH_COUNT.
         if (!hasViewport && !hasViewportWithCount)
-        {
-            // Default to classic – change to WITH_COUNT if your logs show the game uses it
             hs.dynStates.push_back(VK_DYNAMIC_STATE_VIEWPORT);
-        }
-        // If the game already uses one of them we leave it alone.
 
-        // Build our own dynamic-state create info that owns the memory
         hs.dyn.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
         hs.dyn.pNext = nullptr;
         hs.dyn.flags = 0;
         hs.dyn.dynamicStateCount = static_cast<uint32_t>(hs.dynStates.size());
         hs.dyn.pDynamicStates = hs.dynStates.data();
-
         out.pDynamicState = &hs.dyn;
     }
 
     return modified;
 }
-
-// ---------------------------------------------------------------------------
-// Add these two maps next to the existing g_highlightPipelines
-// ---------------------------------------------------------------------------
-std::unordered_map<VkPipeline, VkPipeline> g_highlightColor;   // colour only
-std::unordered_map<VkPipeline, VkPipeline> g_highlightWall;    // Wallwurst only
 
 // ---------------------------------------------------------------------------
 // Full updated DetourVkCreateGraphicsPipelines
@@ -450,8 +428,9 @@ VKAPI_ATTR VkResult VKAPI_CALL DetourVkCreateGraphicsPipelines(
         bool       isLibrary = false;
         uint32_t   stride = 0;
         uint64_t   key = 0;
-        VkPipeline highlightColor = VK_NULL_HANDLE;   // colour only
-        VkPipeline highlightWall = VK_NULL_HANDLE;   // Wallwurst only
+        VkPipeline highlightColor = VK_NULL_HANDLE;
+        VkPipeline highlightWall = VK_NULL_HANDLE;
+        VkPipeline highlightBoth = VK_NULL_HANDLE;   // NEW
         LibInfo    lib;
     };
 
@@ -744,16 +723,14 @@ VKAPI_ATTR VkResult VKAPI_CALL DetourVkCreateGraphicsPipelines(
         {
             VkShaderModule red = ownsFS ? GetRedFragModule(device) : VK_NULL_HANDLE;
 
-            // ---- 1) Colour-only pipeline ----
+            // 1) Colour only
             {
                 HighlightStorage hs;
                 VkGraphicsPipelineCreateInfo hci;
                 auto parts = BuildHighlightCI(ci, owned, red, hs, hci, HL_COLOR);
-
                 const bool complete = isLibrary
                     ? (parts != 0)
                     : ((parts & (kGplFS | kGplFO)) == (kGplFS | kGplFO));
-
                 if (complete)
                 {
                     VkPipeline pipe = VK_NULL_HANDLE;
@@ -762,23 +739,35 @@ VKAPI_ATTR VkResult VKAPI_CALL DetourVkCreateGraphicsPipelines(
                 }
             }
 
-            // ---- 2) Wallwurst-only pipeline (depth off, keep original shader) ----
+            // 2) Wallhack only
             {
                 HighlightStorage hs;
                 VkGraphicsPipelineCreateInfo hci;
                 auto parts = BuildHighlightCI(ci, owned, VK_NULL_HANDLE, hs, hci, HL_Wallwurst);
-
-                const bool complete = isLibrary
-                    ? (parts != 0)
-                    : (parts != 0);   // Wallwurst only needs the FS depth change
-
-                if (complete)
+                if (parts != 0)
                 {
                     VkPipeline pipe = VK_NULL_HANDLE;
                     if (pOriginalCreateGraphicsPipelines(device, cache, 1, &hci, pAllocator, &pipe) == VK_SUCCESS)
                         e.highlightWall = pipe;
                 }
             }
+
+            // 3) Both (red + depth off)  ← NEW
+            {
+                HighlightStorage hs;
+                VkGraphicsPipelineCreateInfo hci;
+                auto parts = BuildHighlightCI(ci, owned, red, hs, hci, HL_COLOR | HL_Wallwurst);
+                const bool complete = isLibrary
+                    ? (parts != 0)
+                    : ((parts & (kGplFS | kGplFO)) == (kGplFS | kGplFO));
+                if (complete)
+                {
+                    VkPipeline pipe = VK_NULL_HANDLE;
+                    if (pOriginalCreateGraphicsPipelines(device, cache, 1, &hci, pAllocator, &pipe) == VK_SUCCESS)
+                        e.highlightBoth = pipe;
+                }
+            }
+
         }
         // (linked-library path can stay as-is or be extended later the same way)
 
@@ -817,6 +806,7 @@ VKAPI_ATTR VkResult VKAPI_CALL DetourVkCreateGraphicsPipelines(
                 g_pipelineKey.erase(e.pipe);
                 g_highlightColor.erase(e.pipe);
                 g_highlightWall.erase(e.pipe);
+                g_highlightBoth.erase(e.pipe);
             }
             else
             {
@@ -824,15 +814,14 @@ VKAPI_ATTR VkResult VKAPI_CALL DetourVkCreateGraphicsPipelines(
                 g_pipelineStrides[e.pipe] = e.stride;
                 g_pipelineKey[e.pipe] = e.key;
 
-                if (e.highlightColor != VK_NULL_HANDLE)
-                    g_highlightColor[e.pipe] = e.highlightColor;
-                else
-                    g_highlightColor.erase(e.pipe);
+                if (e.highlightColor) g_highlightColor[e.pipe] = e.highlightColor;
+                else                  g_highlightColor.erase(e.pipe);
 
-                if (e.highlightWall != VK_NULL_HANDLE)
-                    g_highlightWall[e.pipe] = e.highlightWall;
-                else
-                    g_highlightWall.erase(e.pipe);
+                if (e.highlightWall)  g_highlightWall[e.pipe] = e.highlightWall;
+                else                  g_highlightWall.erase(e.pipe);
+
+                if (e.highlightBoth)  g_highlightBoth[e.pipe] = e.highlightBoth;
+                else                  g_highlightBoth.erase(e.pipe);
             }
         }
     }
@@ -968,6 +957,7 @@ void VKAPI_CALL DetourVkCmdDrawIndexed(VkCommandBuffer cmd, uint32_t idxCount, u
     VkPipeline original = VK_NULL_HANDLE;
     VkPipeline highlightColor = VK_NULL_HANDLE;
     VkPipeline highlightWall = VK_NULL_HANDLE;
+    VkPipeline highlightBoth = VK_NULL_HANDLE;
     uint32_t   dstride = 0;
     uint32_t   pstride = 0;
     uint64_t   key = 0;
@@ -986,6 +976,10 @@ void VKAPI_CALL DetourVkCmdDrawIndexed(VkCommandBuffer cmd, uint32_t idxCount, u
             auto itW = g_highlightWall.find(original);
             if (itW != g_highlightWall.end())
                 highlightWall = itW->second;
+
+            auto itB = g_highlightBoth.find(original);
+            if (itB != g_highlightBoth.end())  
+                highlightBoth = itB->second;
 
             auto pst = g_pipelineStrides.find(original);
             if (pst != g_pipelineStrides.end())
@@ -1047,6 +1041,132 @@ void VKAPI_CALL DetourVkCmdDrawIndexed(VkCommandBuffer cmd, uint32_t idxCount, u
         }
     }
 
+
+    bool wantColor = colorhack && (highlightColor != VK_NULL_HANDLE || highlightBoth != VK_NULL_HANDLE);
+    bool wantWall = Wallwurst && (highlightWall != VK_NULL_HANDLE || highlightBoth != VK_NULL_HANDLE);
+
+    // 1) normal draw
+    if (pOriginalCmdDrawIndexed)
+        pOriginalCmdDrawIndexed(cmd, idxCount, instCount, firstIdx, vtxOff, firstInst);
+
+
+    if (wantWall || wantColor)
+    {
+        auto applyWallViewport = [&]()
+            {
+                if (!pOriginalCmdSetViewport || !hasVp) return;
+                VkViewport hVp = localState.currentViewport;
+                constexpr bool reversedDepth = false;   // set true if game uses reversed-Z (zombie army 4)
+                hVp.minDepth = reversedDepth ? 0.0f : 0.9f;
+                hVp.maxDepth = reversedDepth ? 0.1f : 1.0f;
+                pOriginalCmdSetViewport(cmd, 0, 1, &hVp);
+            };
+        auto restoreViewport = [&]()
+            {
+                if (pOriginalCmdSetViewport && hasVp)
+                    pOriginalCmdSetViewport(cmd, localState.firstViewport, 1, &localState.currentViewport);
+            };
+
+        // --- Wall only ---
+        if (wantWall && !wantColor)
+        {
+            applyWallViewport();
+            if (highlightWall && pOriginalCmdBindPipeline)
+                pOriginalCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, highlightWall);
+            if (pOriginalCmdDrawIndexed)
+                pOriginalCmdDrawIndexed(cmd, idxCount, instCount, firstIdx, vtxOff, firstInst);
+            restoreViewport();
+        }
+        // --- Colour only ---
+        else if (wantColor && !wantWall)
+        {
+            if (highlightColor && pOriginalCmdBindPipeline)
+                pOriginalCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, highlightColor);
+            if (pOriginalCmdDrawIndexed)
+                pOriginalCmdDrawIndexed(cmd, idxCount, instCount, firstIdx, vtxOff, firstInst);
+        }
+        // --- Both: wallhack first (full punch), then colour through walls ---
+        else if (wantWall && wantColor)
+        {
+            applyWallViewport();
+
+            // 1) same solid wallhack as wall-only
+            if (highlightWall && pOriginalCmdBindPipeline)
+                pOriginalCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, highlightWall);
+            if (pOriginalCmdDrawIndexed)
+                pOriginalCmdDrawIndexed(cmd, idxCount, instCount, firstIdx, vtxOff, firstInst);
+
+            // 2) red overlay, still depth-off (keep viewport)
+            VkPipeline colorPipe = highlightBoth ? highlightBoth : highlightColor;
+            if (colorPipe && pOriginalCmdBindPipeline)
+                pOriginalCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, colorPipe);
+            if (pOriginalCmdDrawIndexed)
+                pOriginalCmdDrawIndexed(cmd, idxCount, instCount, firstIdx, vtxOff, firstInst);
+
+            restoreViewport();
+        }
+
+        if (original && pOriginalCmdBindPipeline)
+            pOriginalCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, original);
+    }
+
+
+    /*
+    if (wantWall || wantColor)
+    {
+        auto applyWallViewport = [&]()
+            {
+                if (!pOriginalCmdSetViewport || !hasVp) return;
+                VkViewport hVp = localState.currentViewport;
+                constexpr bool reversedDepth = false;   // set true if game uses reversed-Z (zombie army 4)
+                hVp.minDepth = reversedDepth ? 0.0f : 0.9f;
+                hVp.maxDepth = reversedDepth ? 0.1f : 1.0f;
+                pOriginalCmdSetViewport(cmd, 0, 1, &hVp);
+            };
+        auto restoreViewport = [&]()
+            {
+                if (pOriginalCmdSetViewport && hasVp)
+                    pOriginalCmdSetViewport(cmd, localState.firstViewport, 1, &localState.currentViewport);
+            };
+
+        // Wall only
+        if (wantWall && !wantColor)
+        {
+            applyWallViewport();
+            if (highlightWall && pOriginalCmdBindPipeline)
+                pOriginalCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, highlightWall);
+            if (pOriginalCmdDrawIndexed)
+                pOriginalCmdDrawIndexed(cmd, idxCount, instCount, firstIdx, vtxOff, firstInst);
+            restoreViewport();
+        }
+        // Colour only
+        else if (wantColor && !wantWall)
+        {
+            if (highlightColor && pOriginalCmdBindPipeline)
+                pOriginalCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, highlightColor);
+            if (pOriginalCmdDrawIndexed)
+                pOriginalCmdDrawIndexed(cmd, idxCount, instCount, firstIdx, vtxOff, firstInst);
+        }
+        // Both → one pass, red through walls
+        else if (wantWall && wantColor)
+        {
+            applyWallViewport();
+            VkPipeline pipe = highlightBoth ? highlightBoth
+                : (highlightWall ? highlightWall : highlightColor);
+            if (pipe && pOriginalCmdBindPipeline)
+                pOriginalCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+            if (pOriginalCmdDrawIndexed)
+                pOriginalCmdDrawIndexed(cmd, idxCount, instCount, firstIdx, vtxOff, firstInst);
+            restoreViewport();
+        }
+
+        if (original && pOriginalCmdBindPipeline)
+            pOriginalCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, original);
+    }
+    */
+
+    /*
+    //last working
     bool wantColor = colorhack && (highlightColor != VK_NULL_HANDLE);
     bool wantWall = Wallwurst && (highlightWall != VK_NULL_HANDLE);
 
@@ -1103,7 +1223,7 @@ void VKAPI_CALL DetourVkCmdDrawIndexed(VkCommandBuffer cmd, uint32_t idxCount, u
             pOriginalCmdBindPipeline(
                 cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, original);
     }
-
+    */
 }
 
 //===================================================================================================//
