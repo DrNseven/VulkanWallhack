@@ -10,6 +10,6 @@ The default stride is 40 it is the model recognition for valheim
 
 Toggle wallhack = F3
 Toggle color = F4
-Toggle logging = F5
+Toggle logging = F6
 
 ![alt tag](https://github.com/DrNseven/VulkanWallhack/blob/main/vwallhack.jpg)
