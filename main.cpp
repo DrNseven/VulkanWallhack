@@ -398,7 +398,7 @@ static VkGraphicsPipelineLibraryFlagsEXT BuildHighlightCI(
             auto& att = hs.attachments[a];
             att.blendEnable = VK_FALSE;
             att.colorWriteMask = (a == 0)
-                ? (VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT) //you could change the moving part of the shader color here
+                ? (VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT) //you could change the shader animation color here
                 : 0;
         }
         hs.blend = *ci.pColorBlendState;
@@ -1062,11 +1062,12 @@ void VKAPI_CALL DetourVkCmdDrawIndexed(VkCommandBuffer cmd, uint32_t idxCount, u
     const uint32_t attrcount = pAttr ? pAttr : dAttr;
    
     // Model recognition
-    if (stride != countstride) //countride = 40 by default, 40 = valheim, 48 = zombie army 4: dead war(reversedDepth=true), 28,56? = deadlock
+    if (stride != countstride) //40 = valheim
     //if (stride != 28 && stride != 56) //+44? deadlock
-    //if (stride != 48) //zomby army 4
+    //if (stride != 48) //zomby army 4 (set reversedDepth=true)
+    //if (stride != 20 //world war z
     //if (shortkey != 10) //doom 2016
-    //if (shortkey != 64) // wolfenstein 2: the new colossus
+    //if (shortkey != 64) //wolfenstein 2: the new colossus
     {
         if (pOriginalCmdDrawIndexed)
             pOriginalCmdDrawIndexed(cmd, idxCount, instCount, firstIdx, vtxOff, firstInst);
@@ -1297,6 +1298,7 @@ void VKAPI_CALL DetourVkDestroyPipeline(
 }
 
 /*
+//previous version
 void VKAPI_CALL DetourVkDestroyPipeline(
     VkDevice device,
     VkPipeline pipeline,
