@@ -86,12 +86,6 @@ PFN_vkCmdSetVertexInputEXT pOriginalCmdSetVertexInputEXT = nullptr;
 PFN_vkResetCommandBuffer  pOriginalResetCommandBuffer = nullptr;
 PFN_vkFreeCommandBuffers  pOriginalFreeCommandBuffers = nullptr;
 
-//
-PFN_vkCmdSetDepthTestEnableEXT  pOriginalCmdSetDepthTestEnable = nullptr;
-PFN_vkCmdSetDepthWriteEnableEXT pOriginalCmdSetDepthWriteEnable = nullptr;
-PFN_vkCmdSetDepthCompareOpEXT   pOriginalCmdSetDepthCompareOp = nullptr;
-PFN_vkCmdSetStencilTestEnableEXT pOriginalCmdSetStencilTestEnable = nullptr;
-
 //===================================================================================================//
 
 // Toggle for the diagnostic Log() calls below
@@ -116,11 +110,23 @@ void RemoveCmdState(VkCommandBuffer cmd)
 
 //===================================================================================================//
 
-//Pipeline key
-static std::mutex g_mtx;
-static std::unordered_map<VkPipeline, uint64_t>      g_pipelineKey;  // pipeline -> key
-static std::unordered_map<VkCommandBuffer, uint64_t> g_curKey;       // cmd -> key of bound graphics pipeline
-static std::unordered_map<VkShaderModule, uint64_t> g_moduleHash;  // module -> content hash
+// ---- Per-pipeline extras (one map, one lookup on the hot path) ----
+enum { HLM_COLOR = 0, HLM_WALL = 1, HLM_BOTH = 2, HLM_COUNT = 3 };
+
+struct PipeExtras
+{
+    uint64_t   key = 0;
+    uint32_t   stride = 0;
+    uint32_t   attrCount = 0;
+    VkPipeline hl[HLM_COUNT] = {};
+};
+
+static std::shared_mutex g_mtx;  // was std::mutex — shared for draw reads
+static std::unordered_map<VkPipeline, PipeExtras> g_pipeExtras;
+
+static std::unordered_map<VkCommandBuffer, uint64_t>    g_curKey;
+static std::unordered_map<VkCommandBuffer, VkPipeline> g_curPipeline;
+static std::unordered_map<VkShaderModule, uint64_t>     g_moduleHash;
 
 // Hash helper (64-bit mix)
 static uint64_t combine(uint64_t seed, uint64_t v) {
@@ -169,7 +175,7 @@ VKAPI_ATTR VkResult VKAPI_CALL DetourVkCreateShaderModule(
         // also mix the size so two different-length shaders that somehow produce the same hash still differ
         h = combine(h, pCreateInfo->codeSize);
 
-        std::lock_guard<std::mutex> lock(g_mtx);
+        std::unique_lock<std::shared_mutex> lock(g_mtx);
         g_moduleHash[*pModule] = h;
 
         if (kVerboseKeyLog)
@@ -183,13 +189,12 @@ VKAPI_ATTR VkResult VKAPI_CALL DetourVkCreateShaderModule(
 
 // Maps
 std::unordered_map<VkPipeline, VkPipeline> g_highlightPipelines;   // original -> colored version
-std::unordered_map<VkCommandBuffer, VkPipeline> g_curPipeline;   // currently bound graphics pipeline
 std::unordered_map<VkPipeline, uint32_t> g_pipelineStrides; // pipeline -> binding 0 stride
 
 // Short lock, lookup only, no calls made while it is held
 static bool GetModuleHash(VkShaderModule m, uint64_t& out)
 {
-    std::lock_guard<std::mutex> lock(g_mtx);
+    std::shared_lock<std::shared_mutex> lock(g_mtx);  // read-only, and safe if outer code only held shared
     auto it = g_moduleHash.find(m);
     if (it == g_moduleHash.end())
         return false;
@@ -261,7 +266,6 @@ enum HighlightMode : uint32_t
     HL_Wallwurst = 1 << 1,   // depth test ALWAYS
 };
 
-enum { HLM_COLOR = 0, HLM_WALL = 1, HLM_BOTH = 2, HLM_COUNT = 3 };
 static constexpr uint32_t kModeFlags[HLM_COUNT] = { HL_COLOR, HL_Wallwurst, HL_COLOR | HL_Wallwurst };
 static const char* const  kModeName[HLM_COUNT] = { "color", "wall", "both" };
 
@@ -506,7 +510,7 @@ VKAPI_ATTR VkResult VKAPI_CALL DetourVkCreateGraphicsPipelines(
             for (int m = 0; m < HLM_COUNT; ++m)
                 modeLibs[m] = origLibs;
 
-            std::lock_guard<std::mutex> lock(g_mtx);
+            std::unique_lock<std::shared_mutex> lock(g_mtx);
             for (size_t k = 0; k < origLibs.size(); ++k)
             {
                 auto it = g_libInfo.find(origLibs[k]);
@@ -857,28 +861,26 @@ VKAPI_ATTR VkResult VKAPI_CALL DetourVkCreateGraphicsPipelines(
     // ONE short lock, map writes only
     // ------------------------------------------------------------
     {
-        std::lock_guard<std::mutex> lock(g_mtx);
+        std::unique_lock<std::shared_mutex> lock(g_mtx);
         for (const Entry& e : entries)
         {
             if (e.isLibrary)
             {
                 g_libInfo[e.pipe] = e.lib;
-                g_pipelineStrides.erase(e.pipe);
-                g_pipelineKey.erase(e.pipe);
-                for (int m = 0; m < HLM_COUNT; ++m)
-                    kModeMaps[m]->erase(e.pipe);
+                g_pipeExtras.erase(e.pipe);
             }
             else
             {
                 g_libInfo.erase(e.pipe);
-                g_pipelineStrides[e.pipe] = e.stride;
-                g_pipelineKey[e.pipe] = e.key;
 
+                PipeExtras pe;
+                pe.key = e.key;
+                pe.stride = e.stride;
+                pe.attrCount = e.attrCount;   // was missing before
                 for (int m = 0; m < HLM_COUNT; ++m)
-                {
-                    if (e.hl[m] != VK_NULL_HANDLE) (*kModeMaps[m])[e.pipe] = e.hl[m];
-                    else                           kModeMaps[m]->erase(e.pipe);   // never keep a stale twin
-                }
+                    pe.hl[m] = e.hl[m];
+
+                g_pipeExtras[e.pipe] = pe;
             }
         }
     }
@@ -888,8 +890,8 @@ VKAPI_ATTR VkResult VKAPI_CALL DetourVkCreateGraphicsPipelines(
 
 //===================================================================================================//
 
-void VKAPI_CALL DetourVkCmdBindPipeline(VkCommandBuffer cmd, VkPipelineBindPoint bindPoint, VkPipeline pipeline) {
-
+void VKAPI_CALL DetourVkCmdBindPipeline(VkCommandBuffer cmd, VkPipelineBindPoint bindPoint, VkPipeline pipeline)
+{
     static bool loggedOnce = false;
     if (!loggedOnce) {
         Log("DetourVkCmdBindPipeline");
@@ -898,26 +900,23 @@ void VKAPI_CALL DetourVkCmdBindPipeline(VkCommandBuffer cmd, VkPipelineBindPoint
 
     pOriginalCmdBindPipeline(cmd, bindPoint, pipeline);
 
-    if (bindPoint != VK_PIPELINE_BIND_POINT_GRAPHICS ||
-        pipeline == VK_NULL_HANDLE)
-    {
+    if (bindPoint != VK_PIPELINE_BIND_POINT_GRAPHICS || pipeline == VK_NULL_HANDLE)
         return;
-    }
 
-    std::lock_guard<std::mutex> lock(g_mtx);
+    // ONE lock only – never nest locks on g_mtx
+    std::unique_lock<std::shared_mutex> lock(g_mtx);
 
     uint64_t key = 0;
-
-    auto it = g_pipelineKey.find(pipeline);
-    if (it != g_pipelineKey.end())
-        key = it->second;
+    auto it = g_pipeExtras.find(pipeline);
+    if (it != g_pipeExtras.end())
+        key = it->second.key;
 
     g_curKey[cmd] = key;
     g_curPipeline[cmd] = pipeline;
 
     if (kVerboseKeyLog)
-        Log("Bind: cmd=%p pipeline=%p found=%d key=%llu",
-            (void*)cmd, (void*)pipeline, it != g_pipelineKey.end(), key);
+        Log("Bind: cmd=%p pipeline=%p key=%llu",
+            (void*)cmd, (void*)pipeline, (unsigned long long)key);
 }
 
 //===================================================================================================//
@@ -990,7 +989,7 @@ void VKAPI_CALL DetourVkCmdSetVertexInputEXT(
         const uint32_t stride = pBindings[0].stride;
 
         {
-            std::lock_guard<std::mutex> lock(g_mtx);     // only cheap writes under the lock
+            std::unique_lock<std::shared_mutex> lock(g_mtx);     // only cheap writes under the lock
             g_cmdBufStride[cmd] = stride;
             g_cmdBufVertexInput[cmd] = std::move(st);
         }
@@ -1002,8 +1001,7 @@ void VKAPI_CALL DetourVkCmdSetVertexInputEXT(
 
 //===================================================================================================//
 
-void VKAPI_CALL DetourVkCmdDrawIndexed(VkCommandBuffer cmd, uint32_t idxCount, uint32_t instCount,
-    uint32_t firstIdx, int32_t vtxOff, uint32_t firstInst)
+void VKAPI_CALL DetourVkCmdDrawIndexed(VkCommandBuffer cmd, uint32_t idxCount, uint32_t instCount, uint32_t firstIdx, int32_t vtxOff, uint32_t firstInst)
 {
     static bool loggedOnce = false;
     if (!loggedOnce) {
@@ -1015,41 +1013,32 @@ void VKAPI_CALL DetourVkCmdDrawIndexed(VkCommandBuffer cmd, uint32_t idxCount, u
     VkPipeline highlightColor = VK_NULL_HANDLE;
     VkPipeline highlightWall = VK_NULL_HANDLE;
     VkPipeline highlightBoth = VK_NULL_HANDLE;
-    uint32_t   dstride = 0;
-    uint32_t   pstride = 0;
-    uint64_t   key = 0;
-    uint32_t pAttr = 0, dAttr = 0;
+    uint32_t dstride = 0, pstride = 0, pAttr = 0, dAttr = 0;
+    uint64_t key = 0;
     {
-        std::lock_guard<std::mutex> lock(g_mtx);
+        std::shared_lock<std::shared_mutex> lock(g_mtx);  // read-only
 
         auto pit = g_curPipeline.find(cmd);
         if (pit != g_curPipeline.end())
         {
             original = pit->second;
 
-            auto itC = g_highlightColor.find(original);
-            if (itC != g_highlightColor.end())
-                highlightColor = itC->second;
-
-            auto itW = g_highlightWall.find(original);
-            if (itW != g_highlightWall.end())
-                highlightWall = itW->second;
-
-            auto itB = g_highlightBoth.find(original);
-            if (itB != g_highlightBoth.end())  
-                highlightBoth = itB->second;
-
-            auto pst = g_pipelineStrides.find(original);
-            if (pst != g_pipelineStrides.end())
-                pstride = pst->second;
-
-            auto ait = g_pipelineAttrCount.find(original);
-            if (ait != g_pipelineAttrCount.end()) 
-                pAttr = ait->second;
+            // One pipeline lookup instead of 5–6
+            auto pe = g_pipeExtras.find(original);
+            if (pe != g_pipeExtras.end())
+            {
+                const PipeExtras& e = pe->second;
+                highlightColor = e.hl[HLM_COLOR];
+                highlightWall = e.hl[HLM_WALL];
+                highlightBoth = e.hl[HLM_BOTH];
+                pstride = e.stride;
+                pAttr = e.attrCount;
+                // key often already on g_curKey; can also use e.key
+            }
 
             auto vit = g_cmdBufVertexInput.find(cmd);
-            if (vit != g_cmdBufVertexInput.end()) 
-                dAttr = vit->second.attributeCount;      
+            if (vit != g_cmdBufVertexInput.end())
+                dAttr = vit->second.attributeCount;
         }
 
         auto sit = g_cmdBufStride.find(cmd);
@@ -1063,7 +1052,7 @@ void VKAPI_CALL DetourVkCmdDrawIndexed(VkCommandBuffer cmd, uint32_t idxCount, u
 
     const uint32_t stride = dstride ? dstride : pstride;
     const uint32_t shortkey = static_cast<uint32_t>(key % 100);
-    const uint32_t attrcount = pAttr ? pAttr : dAttr;      // static first, dynamic as the fallback
+    const uint32_t attrcount = pAttr ? pAttr : dAttr;
    
     // Model recognition
     if (stride != countstride) //countride = 40 by default, 40 = valheim, 48 = zombie army 4: dead war(reversedDepth=true), 28,56? = deadlock
@@ -1282,39 +1271,70 @@ void VKAPI_CALL DetourVkDestroyPipeline(
     const VkAllocationCallbacks* pAllocator)
 {
     static bool loggedOnce = false;
+    if (!loggedOnce) {
+        Log("DetourVkDestroyPipeline");
+        loggedOnce = true;
+    }
+
+    // For stability: only erase bookkeeping, do NOT destroy highlight clones here.
+    // Destroying clones while the GPU still references them can hang the device.
+    if (pipeline != VK_NULL_HANDLE)
+    {
+        std::unique_lock<std::shared_mutex> lock(g_mtx);
+        g_pipeExtras.erase(pipeline);
+        g_libInfo.erase(pipeline);
+    }
+
+    if (pOriginalDestroyPipeline)
+        pOriginalDestroyPipeline(device, pipeline, pAllocator);
+}
+
+/*
+void VKAPI_CALL DetourVkDestroyPipeline(
+    VkDevice device,
+    VkPipeline pipeline,
+    const VkAllocationCallbacks* pAllocator)
+{
+    static bool loggedOnce = false;
     if (!loggedOnce)
     {
         Log("DetourVkDestroyPipeline");
         loggedOnce = true;
     }
 
-    VkPipeline clone = VK_NULL_HANDLE;
+    VkPipeline clones[HLM_COUNT] = {};
 
     if (pipeline != VK_NULL_HANDLE)
     {
-        std::lock_guard<std::mutex> lock(g_mtx);
+        std::unique_lock<std::shared_mutex> lock(g_mtx);
 
-        auto it = g_highlightPipelines.find(pipeline);
-        if (it != g_highlightPipelines.end())
+        auto pe = g_pipeExtras.find(pipeline);
+        if (pe != g_pipeExtras.end())
         {
-            clone = it->second;
-            g_highlightPipelines.erase(it);
+            for (int m = 0; m < HLM_COUNT; ++m)
+                clones[m] = pe->second.hl[m];
+            g_pipeExtras.erase(pe);
         }
 
-        g_pipelineStrides.erase(pipeline);
-        g_pipelineKey.erase(pipeline);
+        // If this handle was a library entry, drop it too
+        g_libInfo.erase(pipeline);
     }
 
-    // Destroy the application's pipeline.
-    pOriginalDestroyPipeline(device, pipeline, pAllocator);
+    // Destroy the application's pipeline first
+    if (pOriginalDestroyPipeline)
+        pOriginalDestroyPipeline(device, pipeline, pAllocator);
 
-    // This is only safe if the GPU is no longer using clone.
-    if (clone != VK_NULL_HANDLE)
+    // Then destroy our highlight twins (only safe if the GPU is done with them)
+    if (pOriginalDestroyPipeline)
     {
-        pOriginalDestroyPipeline(device, clone, pAllocator);
+        for (int m = 0; m < HLM_COUNT; ++m)
+        {
+            if (clones[m] != VK_NULL_HANDLE)
+                pOriginalDestroyPipeline(device, clones[m], pAllocator);
+        }
     }
 }
-
+*/
 //===================================================================================================
 
 // Lifetime / cleanup detours
@@ -1327,7 +1347,7 @@ void ClearCmdState(VkCommandBuffer cmd)
         cmdStates.erase(cmd);
     }
 
-    std::lock_guard<std::mutex> lock(g_mtx);
+    std::unique_lock<std::shared_mutex> lock(g_mtx);
     g_cmdBufStride.erase(cmd);
     g_cmdBufVertexInput.erase(cmd);
     g_curKey.erase(cmd);
