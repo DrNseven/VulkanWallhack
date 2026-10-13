@@ -1,7 +1,8 @@
 ﻿//main.h
 
 // Highlight fragment shaders. Compiled with glslang (SPIR-V 1.0).
-// If you want to change this shader, AI can compile it for you, ask claude or grok ect.
+// If you want to change this shader, ask AI to compile a different fragment shader for you. 
+// "SPIR-V shader binary embedded as a uint32_t array."
 
 //Animated shader
 static const uint32_t CustomFragmentShader[] = {
@@ -221,6 +222,36 @@ static const uint32_t CustomFragmentShader[] = {
     0x00000001, 0x00000000, 0x00000004, 0x000200f8, 0x0000000b, 0x0003003e,
     0x00000002, 0x0000000a, 0x000100fd, 0x00010038,
 };
+*/
+
+/*
+// occusion culling exploit untested and game specific
+typedef VkResult(VKAPI_PTR* PFN_vkCreateQueryPool)(VkDevice device, const VkQueryPoolCreateInfo* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkQueryPool* pQueryPool);
+static PFN_vkCreateQueryPool Original_vkCreateQueryPool = nullptr;
+
+VkResult Hooked_vkCreateQueryPool(VkDevice device, const VkQueryPoolCreateInfo* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkQueryPool* pQueryPool) {
+    if (pCreateInfo->queryType == VK_QUERY_TYPE_OCCLUSION) {
+        // Modify the query pool creation info to use a timestamp query instead.
+        VkQueryPoolCreateInfo modifiedCreateInfo = *pCreateInfo; // Copy the original
+        modifiedCreateInfo.queryType = VK_QUERY_TYPE_TIMESTAMP; // Change query type
+        modifiedCreateInfo.pipelineStatistics = 0; // Important: clear this
+
+        //Log("Replaced OCCLUSION query with TIMESTAMP query.");
+        return Original_vkCreateQueryPool(device, &modifiedCreateInfo, pAllocator, pQueryPool);
+    }
+    else if (pCreateInfo->queryType == VK_QUERY_TYPE_PIPELINE_STATISTICS && (pCreateInfo->pipelineStatistics & VK_QUERY_PIPELINE_STATISTIC_INPUT_ASSEMBLY_VERTICES_BIT))
+    {
+        VkQueryPoolCreateInfo modifiedCreateInfo = *pCreateInfo; // Copy the original
+        modifiedCreateInfo.queryType = VK_QUERY_TYPE_TIMESTAMP; // Change query type
+        modifiedCreateInfo.pipelineStatistics = 0; // Important: clear this
+
+        //Log("Replaced PIPELINE query with TIMESTAMP query.");
+        return Original_vkCreateQueryPool(device, &modifiedCreateInfo, pAllocator, pQueryPool);
+    }
+
+    // For other query types, just call the original function.
+    return Original_vkCreateQueryPool(device, pCreateInfo, pAllocator, pQueryPool);
+}
 */
 
 /*
