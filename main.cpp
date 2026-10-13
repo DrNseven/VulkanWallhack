@@ -568,28 +568,35 @@ VKAPI_ATTR VkResult VKAPI_CALL DetourVkCreateGraphicsPipelines(
         uint32_t ownStride = 0;
         uint32_t ownAttrCount = 0;
         uint32_t ownBindingCount = 0;
-        if (!strideDyn && vis && vis->pVertexBindingDescriptions && vis->vertexBindingDescriptionCount > 0)
+
+        if (vis)
         {
             ownAttrCount = vis->vertexAttributeDescriptionCount;
             ownBindingCount = vis->vertexBindingDescriptionCount;
 
-            uint32_t primary = vis->pVertexBindingDescriptions[0].binding;
-            if (vis->pVertexAttributeDescriptions && vis->vertexAttributeDescriptionCount > 0)
-                primary = vis->pVertexAttributeDescriptions[0].binding;
-            for (uint32_t b = 0; b < vis->vertexBindingDescriptionCount; ++b)
+            if (!strideDyn && vis->pVertexBindingDescriptions && vis->vertexBindingDescriptionCount > 0)
             {
-                if (vis->pVertexBindingDescriptions[b].binding == primary)
+                uint32_t primary = vis->pVertexBindingDescriptions[0].binding;
+                if (vis->pVertexAttributeDescriptions && vis->vertexAttributeDescriptionCount > 0)
+                    primary = vis->pVertexAttributeDescriptions[0].binding;
+
+                for (uint32_t b = 0; b < vis->vertexBindingDescriptionCount; ++b)
                 {
-                    ownStride = vis->pVertexBindingDescriptions[b].stride; //<- pipeline stride
-                    break;
+                    if (vis->pVertexBindingDescriptions[b].binding == primary)
+                    {
+                        ownStride = vis->pVertexBindingDescriptions[b].stride;
+                        break;
+                    }
                 }
             }
         }
+
         const uint32_t stride = ownsVI ? ownStride : libStride;
         const uint32_t attrCount = ownsVI ? ownAttrCount : libAttrCount;
         const uint32_t bindingCount = ownsVI ? ownBindingCount : libBindingCount;
         const bool strideUnknown = ownsVI ? (vinDyn || strideDyn) : libStrideUnknown;
         e.stride = stride;
+        e.attrCount = attrCount;
 
         // ------------------------------------------------------------
         // Key (own state only, then combined with the libraries' keys)
@@ -1023,7 +1030,7 @@ void VKAPI_CALL DetourVkCmdDrawIndexed(VkCommandBuffer cmd, uint32_t idxCount, u
         {
             original = pit->second;
 
-            // One pipeline lookup instead of 5–6
+            // One pipeline lookup
             auto pe = g_pipeExtras.find(original);
             if (pe != g_pipeExtras.end())
             {
