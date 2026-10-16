@@ -766,8 +766,9 @@ VKAPI_ATTR VkResult VKAPI_CALL DetourVkCreateGraphicsPipelines(
                         (void*)e.pipe, isLibrary ? "lib" : (isLinked ? "linked" : "full"));
             };
 
-        if (!isLinked && (!ownsFS || realDepthTest) &&
-            (isLibrary ? (ownsFS || ownsFO) : (hasFrag && strideWanted)))
+        //if (!isLinked && (!ownsFS || realDepthTest) && (isLibrary ? (ownsFS || ownsFO) : (hasFrag && strideWanted))) //too strict
+        //if (!isLinked && (isLibrary ? (ownsFS || ownsFO) : (hasFrag && strideWanted)))
+        if (!isLinked && (isLibrary ? (ownsFS || ownsFO) : (hasFrag)))
         {
             // (A) library: always build twins (cheap). (B) monolithic: model pipelines only.
             VkShaderModule red = ownsFS ? GetRedFragModule(device) : VK_NULL_HANDLE;
@@ -1016,12 +1017,15 @@ void VKAPI_CALL DetourVkCmdDrawIndexed(VkCommandBuffer cmd, uint32_t idxCount, u
         loggedOnce = true;
     }
 
+    
     VkPipeline original = VK_NULL_HANDLE;
     VkPipeline highlightColor = VK_NULL_HANDLE;
     VkPipeline highlightWall = VK_NULL_HANDLE;
     VkPipeline highlightBoth = VK_NULL_HANDLE;
     uint32_t dstride = 0, pstride = 0, pAttr = 0, dAttr = 0;
     uint64_t key = 0;
+    static std::atomic<int> n{ 0 };
+    bool havePipe = false, haveExtras = false;
     {
         std::shared_lock<std::shared_mutex> lock(g_mtx);  // read-only
 
@@ -1042,6 +1046,11 @@ void VKAPI_CALL DetourVkCmdDrawIndexed(VkCommandBuffer cmd, uint32_t idxCount, u
                 pAttr = e.attrCount;
                 // key often already on g_curKey; can also use e.key
             }
+            havePipe = (pit != g_curPipeline.end());
+            haveExtras = havePipe && (pe != g_pipeExtras.end());
+            if (n++ < 2)
+                Log("1.DrawIndexed: IC: pipe=%d extras=%d hlColor=%p attr=%u stride=%u\n",
+                    havePipe, haveExtras, (void*)highlightColor, pAttr, pstride);
 
             auto vit = g_cmdBufVertexInput.find(cmd);
             if (vit != g_cmdBufVertexInput.end())
@@ -1062,7 +1071,7 @@ void VKAPI_CALL DetourVkCmdDrawIndexed(VkCommandBuffer cmd, uint32_t idxCount, u
     const uint32_t attrcount = pAttr ? pAttr : dAttr;
    
     // Model recognition
-    if (stride != countstride) //40 = valheim
+    if (shortkey != countstride) //40 = valheim
     //if (stride != 28 && stride != 56) //+44? deadlock
     //if (stride != 48) //zomby army 4 (set reversedDepth=true)
     //if (stride != 20 //world war z
@@ -1217,6 +1226,7 @@ void VKAPI_CALL DetourVkCmdDrawIndexed(VkCommandBuffer cmd, uint32_t idxCount, u
                 cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, original);
     }
     */
+    //return pOriginalCmdDrawIndexed(cmd, idxCount, instCount, firstIdx, vtxOff, firstInst);
 }
 
 //===================================================================================================//
@@ -1230,8 +1240,338 @@ void VKAPI_CALL DetourVkCmdDrawIndexedIndirect(VkCommandBuffer cmd, VkBuffer buf
     }
     
     //if game is drawing models in DrawIndexedIndirect, paste code from DrawIndexed here
+    VkPipeline original = VK_NULL_HANDLE;
+    VkPipeline highlightColor = VK_NULL_HANDLE;
+    VkPipeline highlightWall = VK_NULL_HANDLE;
+    VkPipeline highlightBoth = VK_NULL_HANDLE;
+    uint32_t dstride = 0, pstride = 0, pAttr = 0, dAttr = 0;
+    uint64_t key = 0;
+    static std::atomic<int> n{ 0 };
+    bool havePipe = false, haveExtras = false;
+    {
+        std::shared_lock<std::shared_mutex> lock(g_mtx);  // read-only
+
+        auto pit = g_curPipeline.find(cmd);
+        if (pit != g_curPipeline.end())
+        {
+            original = pit->second;
+
+            // One pipeline lookup
+            auto pe = g_pipeExtras.find(original);
+            if (pe != g_pipeExtras.end())
+            {
+                const PipeExtras& e = pe->second;
+                highlightColor = e.hl[HLM_COLOR];
+                highlightWall = e.hl[HLM_WALL];
+                highlightBoth = e.hl[HLM_BOTH];
+                pstride = e.stride;
+                pAttr = e.attrCount;
+                // key often already on g_curKey; can also use e.key
+            }
+            havePipe = (pit != g_curPipeline.end());
+            haveExtras = havePipe && (pe != g_pipeExtras.end());
+            if (n++ < 2)
+                Log("2.DrawIndexedIndirect IC: pipe=%d extras=%d hlColor=%p attr=%u stride=%u\n",
+                    havePipe, haveExtras, (void*)highlightColor, pAttr, pstride);
+
+            auto vit = g_cmdBufVertexInput.find(cmd);
+            if (vit != g_cmdBufVertexInput.end())
+                dAttr = vit->second.attributeCount;
+        }
+
+        auto sit = g_cmdBufStride.find(cmd);
+        if (sit != g_cmdBufStride.end())
+            dstride = sit->second;
+
+        auto kit = g_curKey.find(cmd);
+        if (kit != g_curKey.end())
+            key = kit->second;
+    }
+
+    const uint32_t stride = dstride ? dstride : pstride;
+    const uint32_t shortkey = static_cast<uint32_t>(key % 100);
+    const uint32_t attrcount = pAttr ? pAttr : dAttr;
+
+    // Model recognition
+    if (shortkey != countstride) //40 = valheim
+        //if (stride != 28 && stride != 56) //+44? deadlock
+        //if (stride != 48) //zomby army 4 (set reversedDepth=true)
+        //if (stride != 20 //world war z
+        //if (shortkey != 10) //doom 2016
+        //if (shortkey != 64) //wolfenstein 2: the new colossus
+    {
+        if (pOriginalCmdDrawIndexedIndirect)
+            pOriginalCmdDrawIndexedIndirect(cmd, buffer, offset, drawCount, istride);
+        return;
+    }
+
+    if (logvalues)
+    {
+        //static std::atomic<int> s_infoLogs{ 0 };
+        //if (s_infoLogs.fetch_add(1) < 20)
+        Log("stride == %d && dstride == %d && pstride == %d && shortkey == %d && attrcount == %d",
+            stride, dstride, pstride, shortkey, attrcount);
+    }
+
+    // ------------------------------------------------------------------
+    // Capture viewport
+    // ------------------------------------------------------------------
+    bool hasVp = false;
+    CmdState localState{};
+    {
+        std::shared_lock<std::shared_mutex> lock(statesMtx);
+        auto it = cmdStates.find(cmd);
+        if (it != cmdStates.end() && it->second.hasViewport)
+        {
+            localState = it->second;
+            hasVp = true;
+        }
+    }
+
+
+    bool wantColor = colorhack && (highlightColor != VK_NULL_HANDLE || highlightBoth != VK_NULL_HANDLE);
+    bool wantWall = Wallwurst && (highlightWall != VK_NULL_HANDLE || highlightBoth != VK_NULL_HANDLE);
+
+    // 1) normal draw
+    if (pOriginalCmdDrawIndexedIndirect)
+        pOriginalCmdDrawIndexedIndirect(cmd, buffer, offset, drawCount, istride);
+
+    //same color behind and infront of walls
+    if (wantWall || wantColor)
+    {
+        auto applyWallViewport = [&]()
+            {
+                if (!pOriginalCmdSetViewport || !hasVp) return;
+                VkViewport hVp = localState.currentViewport;
+                constexpr bool reversedDepth = false;   // set true if game uses reversed-Z (zombie army 4)
+                hVp.minDepth = reversedDepth ? 0.0f : 0.9f;
+                hVp.maxDepth = reversedDepth ? 0.1f : 1.0f;
+                pOriginalCmdSetViewport(cmd, 0, 1, &hVp);
+            };
+        auto restoreViewport = [&]()
+            {
+                if (pOriginalCmdSetViewport && hasVp)
+                    pOriginalCmdSetViewport(cmd, localState.firstViewport, 1, &localState.currentViewport);
+            };
+
+        // --- Wall only ---
+        if (wantWall && !wantColor)
+        {
+            applyWallViewport();
+            if (highlightWall && pOriginalCmdBindPipeline)
+                pOriginalCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, highlightWall);
+            if (pOriginalCmdDrawIndexedIndirect)
+                pOriginalCmdDrawIndexedIndirect(cmd, buffer, offset, drawCount, istride);
+            restoreViewport();
+        }
+        // --- Colour only ---
+        else if (wantColor && !wantWall)
+        {
+            if (highlightColor && pOriginalCmdBindPipeline)
+                pOriginalCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, highlightColor);
+            if (pOriginalCmdDrawIndexedIndirect)
+                pOriginalCmdDrawIndexedIndirect(cmd, buffer, offset, drawCount, istride);
+        }
+        // --- Both: wallhack first (full punch), then colour through walls ---
+        else if (wantWall && wantColor)
+        {
+            applyWallViewport();
+
+            // 1) same solid wallhack as wall-only
+            if (highlightWall && pOriginalCmdBindPipeline)
+                pOriginalCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, highlightWall);
+            if (pOriginalCmdDrawIndexedIndirect)
+                pOriginalCmdDrawIndexedIndirect(cmd, buffer, offset, drawCount, istride);
+
+            // 2) red overlay, still depth-off (keep viewport)
+            VkPipeline colorPipe = highlightBoth ? highlightBoth : highlightColor;
+            if (colorPipe && pOriginalCmdBindPipeline)
+                pOriginalCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, colorPipe);
+            if (pOriginalCmdDrawIndexedIndirect)
+                pOriginalCmdDrawIndexedIndirect(cmd, buffer, offset, drawCount, istride);
+
+            restoreViewport();
+        }
+
+        if (original && pOriginalCmdBindPipeline)
+            pOriginalCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, original);
+    }
     
-    return pOriginalCmdDrawIndexedIndirect(cmd, buffer, offset, drawCount, istride);
+    //return pOriginalCmdDrawIndexedIndirect(cmd, buffer, offset, drawCount, istride);
+}
+
+//===================================================================================================//
+
+void VKAPI_CALL DetourVkCmdDrawIndexedIndirectCount(
+    VkCommandBuffer cmd, VkBuffer buffer, VkDeviceSize offset,
+    VkBuffer countBuffer, VkDeviceSize countBufferOffset,
+    uint32_t maxDrawCount, uint32_t istride)
+{
+    static bool loggedOnce = false;
+    if (!loggedOnce) {
+        Log("DetourVkCmdDrawIndexedIndirectCount");
+        loggedOnce = true;
+    }
+
+    //if game is drawing models in DrawIndexedIndirect, paste code from DrawIndexed here
+    VkPipeline original = VK_NULL_HANDLE;
+    VkPipeline highlightColor = VK_NULL_HANDLE;
+    VkPipeline highlightWall = VK_NULL_HANDLE;
+    VkPipeline highlightBoth = VK_NULL_HANDLE;
+    uint32_t dstride = 0, pstride = 0, pAttr = 0, dAttr = 0;
+    uint64_t key = 0;
+    static std::atomic<int> n{ 0 };
+    bool havePipe = false, haveExtras = false;
+    {
+        std::shared_lock<std::shared_mutex> lock(g_mtx);  // read-only
+
+        auto pit = g_curPipeline.find(cmd);
+        if (pit != g_curPipeline.end())
+        {
+            original = pit->second;
+
+            // One pipeline lookup
+            auto pe = g_pipeExtras.find(original);
+            if (pe != g_pipeExtras.end())
+            {
+                const PipeExtras& e = pe->second;
+                highlightColor = e.hl[HLM_COLOR];
+                highlightWall = e.hl[HLM_WALL];
+                highlightBoth = e.hl[HLM_BOTH];
+                pstride = e.stride;
+                pAttr = e.attrCount;
+                // key often already on g_curKey; can also use e.key
+            }
+            havePipe = (pit != g_curPipeline.end());
+            haveExtras = havePipe && (pe != g_pipeExtras.end());
+            if (n++ < 2)
+                Log("3.DrawIndexedIndirectCount IC: pipe=%d extras=%d hlColor=%p attr=%u stride=%u\n",
+                    havePipe, haveExtras, (void*)highlightColor, pAttr, pstride);
+
+            auto vit = g_cmdBufVertexInput.find(cmd);
+            if (vit != g_cmdBufVertexInput.end())
+                dAttr = vit->second.attributeCount;
+        }
+
+        auto sit = g_cmdBufStride.find(cmd);
+        if (sit != g_cmdBufStride.end())
+            dstride = sit->second;
+
+        auto kit = g_curKey.find(cmd);
+        if (kit != g_curKey.end())
+            key = kit->second;
+    }
+
+    const uint32_t stride = dstride ? dstride : pstride;
+    const uint32_t shortkey = static_cast<uint32_t>(key % 100);
+    const uint32_t attrcount = pAttr ? pAttr : dAttr;
+
+    // Model recognition
+    if (shortkey != countstride) //40 = valheim
+        //if (stride != 28 && stride != 56) //+44? deadlock
+        //if (stride != 48) //zomby army 4 (set reversedDepth=true)
+        //if (stride != 20 //world war z
+        //if (shortkey != 10) //doom 2016
+        //if (shortkey != 64) //wolfenstein 2: the new colossus
+    {
+        if (pOriginalCmdDrawIndexedIndirectCount)
+            pOriginalCmdDrawIndexedIndirectCount(cmd, buffer, offset, countBuffer, countBufferOffset, maxDrawCount, istride);
+        return;
+    }
+
+    if (logvalues)
+    {
+        //static std::atomic<int> s_infoLogs{ 0 };
+        //if (s_infoLogs.fetch_add(1) < 20)
+        Log("stride == %d && dstride == %d && pstride == %d && shortkey == %d && attrcount == %d",
+            stride, dstride, pstride, shortkey, attrcount);
+    }
+
+    // ------------------------------------------------------------------
+    // Capture viewport
+    // ------------------------------------------------------------------
+    bool hasVp = false;
+    CmdState localState{};
+    {
+        std::shared_lock<std::shared_mutex> lock(statesMtx);
+        auto it = cmdStates.find(cmd);
+        if (it != cmdStates.end() && it->second.hasViewport)
+        {
+            localState = it->second;
+            hasVp = true;
+        }
+    }
+
+
+    bool wantColor = colorhack && (highlightColor != VK_NULL_HANDLE || highlightBoth != VK_NULL_HANDLE);
+    bool wantWall = Wallwurst && (highlightWall != VK_NULL_HANDLE || highlightBoth != VK_NULL_HANDLE);
+
+    // 1) normal draw
+    if (pOriginalCmdDrawIndexedIndirectCount)
+        pOriginalCmdDrawIndexedIndirectCount(cmd, buffer, offset, countBuffer, countBufferOffset, maxDrawCount, istride);
+
+    //same color behind and infront of walls
+    if (wantWall || wantColor)
+    {
+        auto applyWallViewport = [&]()
+            {
+                if (!pOriginalCmdSetViewport || !hasVp) return;
+                VkViewport hVp = localState.currentViewport;
+                constexpr bool reversedDepth = false;   // set true if game uses reversed-Z (zombie army 4)
+                hVp.minDepth = reversedDepth ? 0.0f : 0.9f;
+                hVp.maxDepth = reversedDepth ? 0.1f : 1.0f;
+                pOriginalCmdSetViewport(cmd, 0, 1, &hVp);
+            };
+        auto restoreViewport = [&]()
+            {
+                if (pOriginalCmdSetViewport && hasVp)
+                    pOriginalCmdSetViewport(cmd, localState.firstViewport, 1, &localState.currentViewport);
+            };
+
+        // --- Wall only ---
+        if (wantWall && !wantColor)
+        {
+            applyWallViewport();
+            if (highlightWall && pOriginalCmdBindPipeline)
+                pOriginalCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, highlightWall);
+            if (pOriginalCmdDrawIndexedIndirectCount)
+                pOriginalCmdDrawIndexedIndirectCount(cmd, buffer, offset, countBuffer, countBufferOffset, maxDrawCount, istride);
+            restoreViewport();
+        }
+        // --- Colour only ---
+        else if (wantColor && !wantWall)
+        {
+            if (highlightColor && pOriginalCmdBindPipeline)
+                pOriginalCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, highlightColor);
+            if (pOriginalCmdDrawIndexedIndirectCount)
+                pOriginalCmdDrawIndexedIndirectCount(cmd, buffer, offset, countBuffer, countBufferOffset, maxDrawCount, istride);
+        }
+        // --- Both: wallhack first (full punch), then colour through walls ---
+        else if (wantWall && wantColor)
+        {
+            applyWallViewport();
+
+            // 1) same solid wallhack as wall-only
+            if (highlightWall && pOriginalCmdBindPipeline)
+                pOriginalCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, highlightWall);
+            if (pOriginalCmdDrawIndexedIndirectCount)
+                pOriginalCmdDrawIndexedIndirectCount(cmd, buffer, offset, countBuffer, countBufferOffset, maxDrawCount, istride);
+
+            // 2) red overlay, still depth-off (keep viewport)
+            VkPipeline colorPipe = highlightBoth ? highlightBoth : highlightColor;
+            if (colorPipe && pOriginalCmdBindPipeline)
+                pOriginalCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, colorPipe);
+            if (pOriginalCmdDrawIndexedIndirectCount)
+                pOriginalCmdDrawIndexedIndirectCount(cmd, buffer, offset, countBuffer, countBufferOffset, maxDrawCount, istride);
+
+            restoreViewport();
+        }
+
+        if (original && pOriginalCmdBindPipeline)
+            pOriginalCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, original);
+    }
+
+    //return pOriginalCmdDrawIndexedIndirectCount(cmd, buffer, offset, countBuffer, countBufferOffset, maxDrawCount, istride);
 }
 
 //===================================================================================================//
@@ -1493,6 +1833,7 @@ static bool HookViaDummyDevice()
         { "vkCmdSetViewportWithCount", (void*)DetourVkCmdSetViewportWithCount, (void**)&pOriginalCmdSetViewportWithCount },
         { "vkCmdDrawIndexed",          (void*)DetourVkCmdDrawIndexed,          (void**)&pOriginalCmdDrawIndexed },
         { "vkCmdDrawIndexedIndirect",  (void*)DetourVkCmdDrawIndexedIndirect,  (void**)&pOriginalCmdDrawIndexedIndirect },
+        { "vkCmdDrawIndexedIndirectCount",  (void*)DetourVkCmdDrawIndexedIndirectCount,  (void**)&pOriginalCmdDrawIndexedIndirectCount },
         { "vkDestroyPipeline",         (void*)DetourVkDestroyPipeline,         (void**)&pOriginalDestroyPipeline },
         { "vkResetCommandBuffer",      (void*)DetourVkResetCommandBuffer,      (void**)&pOriginalResetCommandBuffer },
         { "vkFreeCommandBuffers",      (void*)DetourVkFreeCommandBuffers,      (void**)&pOriginalFreeCommandBuffers },
