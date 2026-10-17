@@ -25,10 +25,10 @@
 //===================================================================================================//
 
 // Globals
-int countstride = 40; //40 = valheim, 48 = zombie army 4: dead war(reversedDepth=true), 28/56 = deadlock
+int countnum = 30; //40 = valheim, 48 = zombie army 4: dead war(reversedDepth=true), 28/56 = deadlock
 std::atomic<bool> Wallwurst{ true };
 std::atomic<bool> colorhack{ true };
-std::atomic<bool> logvalues{ false };
+std::atomic<bool> logvaluesonce{ false };
 
 //Log
 inline void Log(const char* fmt, ...) {
@@ -929,6 +929,135 @@ void VKAPI_CALL DetourVkCmdBindPipeline(VkCommandBuffer cmd, VkPipelineBindPoint
 
 //===================================================================================================//
 
+struct IndexState {
+    VkBuffer buffer;
+    VkIndexType type;
+    VkDeviceSize offset;
+};
+std::unordered_map<VkCommandBuffer, IndexState> cmdIndexMap;
+
+typedef void (VKAPI_PTR* PFN_vkCmdBindIndexBuffer)(VkCommandBuffer cmd, VkBuffer buffer, VkDeviceSize offset, VkIndexType indexType);
+PFN_vkCmdBindIndexBuffer pOriginalCmdBindIndexBuffer = nullptr;
+
+void VKAPI_CALL DetourVkCmdBindIndexBuffer(VkCommandBuffer cmd, VkBuffer buffer, VkDeviceSize offset, VkIndexType indexType) {
+
+    static bool loggedOnce = false;
+    if (!loggedOnce) {
+        Log("VkCmdBindIndexBuffer");
+        loggedOnce = true;
+    }
+
+    {
+        std::unique_lock<std::shared_mutex> lock(g_mtx);
+        cmdIndexMap[cmd] = { buffer, indexType, offset };
+    }
+
+    pOriginalCmdBindIndexBuffer(cmd, buffer, offset, indexType);
+}
+
+//===================================================================================================//
+
+typedef void (VKAPI_PTR* PFN_vkCmdPushConstants)(VkCommandBuffer, VkPipelineLayout, VkShaderStageFlags, uint32_t, uint32_t, const void*);
+PFN_vkCmdPushConstants pOriginalCmdPushConstants = nullptr;
+
+struct PushConstantState {
+    uint8_t  data[128] = {};   // Vulkan guarantees at least 128 bytes
+    uint32_t dirtyMask = 0;    // one bit per dword written
+};
+
+std::unordered_map<VkCommandBuffer, PushConstantState> cmdPushMap;
+
+void VKAPI_CALL DetourCmdPushConstants(VkCommandBuffer cb, VkPipelineLayout layout,
+    VkShaderStageFlags stages, uint32_t offset, uint32_t size, const void* pValues)
+{
+    if (pValues && offset + size <= sizeof(PushConstantState::data)) {
+        std::unique_lock<std::shared_mutex> lock(statesMtx);
+        auto& s = cmdPushMap[cb];
+        std::memcpy(s.data + offset, pValues, size);
+        for (uint32_t o = offset; o < offset + size; o += 4)
+            s.dirtyMask |= 1u << (o / 4);
+    }
+    pOriginalCmdPushConstants(cb, layout, stages, offset, size, pValues);
+}
+
+/*
+struct PushConstantState {
+    uint32_t size = 0;       // Number of bytes passed to Vulkan
+    uint32_t offset = 0;          // Push-constant destination offset
+    VkShaderStageFlags stages = 0;
+    uint32_t firstWord = 0;       // First 4 bytes, if available
+    bool hasFirstWord = false;
+};
+
+std::unordered_map<VkCommandBuffer, PushConstantState> cmdPushMap;
+
+void VKAPI_CALL DetourCmdPushConstants(
+    VkCommandBuffer commandBuffer,
+    VkPipelineLayout layout,
+    VkShaderStageFlags stageFlags,
+    uint32_t offset,
+    uint32_t size,
+    const void* pValues)
+{
+    PushConstantState next{};
+    next.size = size;
+    next.offset = offset;
+    next.stages = stageFlags;
+
+    if (pValues && size >= sizeof(next.firstWord)) {
+        std::memcpy(
+            &next.firstWord,
+            pValues,
+            sizeof(next.firstWord));
+        next.hasFirstWord = true;
+    }
+
+    {
+        std::unique_lock<std::shared_mutex> lock(statesMtx);
+        cmdPushMap[commandBuffer] = next;
+    }
+
+    if (pOriginalCmdPushConstants) {
+        pOriginalCmdPushConstants(
+            commandBuffer, layout, stageFlags, offset, size, pValues);
+    }
+}
+*/
+
+/*
+void VKAPI_CALL DetourCmdPushConstants(
+    VkCommandBuffer commandBuffer,
+    VkPipelineLayout layout,
+    VkShaderStageFlags stageFlags,
+    uint32_t offset,
+    uint32_t size,
+    const void* pValues)
+{
+    static bool loggedOnce = false;
+    if (!loggedOnce) {
+        Log("vkCmdPushConstants");
+        loggedOnce = true;
+    }
+
+        std::unique_lock<std::shared_mutex> lock(statesMtx);
+
+        auto& state = cmdPushMap[commandBuffer];
+
+        state.size = size;
+        state.offset = offset;
+        state.stages = stageFlags;
+        state.hasFirstWord = size >= sizeof(uint32_t) && pValues != nullptr;
+
+        if (offset == 0 && state.hasFirstWord) {
+            std::memcpy(&state.firstWord, pValues, sizeof(state.firstWord));
+        }
+
+    pOriginalCmdPushConstants(commandBuffer, layout, stageFlags, offset, size, pValues);
+}
+*/
+
+//===================================================================================================//
+
 void VKAPI_CALL DetourVkCmdSetViewport(VkCommandBuffer cmd, uint32_t first, uint32_t count, const VkViewport* pVp) {
 
     static bool loggedOnce = false;
@@ -1024,6 +1153,8 @@ void VKAPI_CALL DetourVkCmdDrawIndexed(VkCommandBuffer cmd, uint32_t idxCount, u
     VkPipeline highlightBoth = VK_NULL_HANDLE;
     uint32_t dstride = 0, pstride = 0, pAttr = 0, dAttr = 0;
     uint64_t key = 0;
+    uint32_t pushword = 0;
+    bool havePush = false;
     static std::atomic<int> n{ 0 };
     bool havePipe = false, haveExtras = false;
     {
@@ -1049,7 +1180,7 @@ void VKAPI_CALL DetourVkCmdDrawIndexed(VkCommandBuffer cmd, uint32_t idxCount, u
             havePipe = (pit != g_curPipeline.end());
             haveExtras = havePipe && (pe != g_pipeExtras.end());
             if (n++ < 2)
-                Log("1.DrawIndexed: IC: pipe=%d extras=%d hlColor=%p attr=%u stride=%u\n",
+                Log("1.DrawIndexed: IC: pipe=%d extras=%d hlColor=%p attr=%u stride=%u",
                     havePipe, haveExtras, (void*)highlightColor, pAttr, pstride);
 
             auto vit = g_cmdBufVertexInput.find(cmd);
@@ -1064,31 +1195,47 @@ void VKAPI_CALL DetourVkCmdDrawIndexed(VkCommandBuffer cmd, uint32_t idxCount, u
         auto kit = g_curKey.find(cmd);
         if (kit != g_curKey.end())
             key = kit->second;
+
+        auto it = cmdPushMap.find(cmd);
+        if (it != cmdPushMap.end()) {
+            const PushConstantState& s = it->second;
+            constexpr uint32_t kStableDword = 0;               // set after logging which dword is stable
+            if (s.dirtyMask & (1u << kStableDword)) {          // only use it if it was actually written
+                std::memcpy(&pushword, s.data + kStableDword * 4, sizeof(uint32_t));
+                havePush = true;
+            }
+        }
     }
 
     const uint32_t stride = dstride ? dstride : pstride;
     const uint32_t shortkey = static_cast<uint32_t>(key % 100);
     const uint32_t attrcount = pAttr ? pAttr : dAttr;
+    const uint32_t shortpword = static_cast<uint32_t>(pushword % 100);
    
-    // Model recognition
-    if (shortkey != countstride) //40 = valheim
-    //if (stride != 28 && stride != 56) //+44? deadlock
-    //if (stride != 48) //zomby army 4 (set reversedDepth=true)
-    //if (stride != 20 //world war z
-    //if (shortkey != 10) //doom 2016
-    //if (shortkey != 64) //wolfenstein 2: the new colossus
+    // Model recognition (you are in DrawIndexed(1))
+    if (shortkey != countnum)
+        //if(stride != countnum)
+        //if(shortpword != countnum)
+        //if (stride != 40) //valheim
+        //if (stride != 28 && stride != 56) //+44? deadlock
+        //if (stride != 48) //zomby army 4 (set reversedDepth=true)
+        //if (stride != 20 //world war z
+        //if (shortkey != 10) //doom 2016
+        //if (shortkey != 64) //wolfenstein 2: the new colossus
+        //if (shortkey != 30) //enshrouded
+        //if (shortkey != 18) //doom the dark ages (heavy occlusion ruines wallhack)
     {
         if (pOriginalCmdDrawIndexed)
             pOriginalCmdDrawIndexed(cmd, idxCount, instCount, firstIdx, vtxOff, firstInst);
         return;
     }
 
-    if (logvalues)
+    if (logvaluesonce)
     {
-        //static std::atomic<int> s_infoLogs{ 0 };
-        //if (s_infoLogs.fetch_add(1) < 20)
-        Log("stride == %d && dstride == %d && pstride == %d && shortkey == %d && attrcount == %d && idxCount == %d",
-            stride, dstride, pstride, shortkey, attrcount, idxCount);
+        static std::atomic<int> s_infoLogs{ 0 };
+        if (s_infoLogs.fetch_add(1) < 20)
+        Log("1. stride == %d && dstride == %d && pstride == %d && shortkey == %d && attrcount == %d && idxCount == %d && shortpword == %d",
+            stride, dstride, pstride, shortkey, attrcount, idxCount, shortpword);
     }
 
     // ------------------------------------------------------------------
@@ -1239,13 +1386,14 @@ void VKAPI_CALL DetourVkCmdDrawIndexedIndirect(VkCommandBuffer cmd, VkBuffer buf
         loggedOnce = true;
     }
     
-    //if game is drawing models in DrawIndexedIndirect, paste code from DrawIndexed here
     VkPipeline original = VK_NULL_HANDLE;
     VkPipeline highlightColor = VK_NULL_HANDLE;
     VkPipeline highlightWall = VK_NULL_HANDLE;
     VkPipeline highlightBoth = VK_NULL_HANDLE;
     uint32_t dstride = 0, pstride = 0, pAttr = 0, dAttr = 0;
     uint64_t key = 0;
+    uint32_t pushword = 0;
+    bool havePush = false;
     static std::atomic<int> n{ 0 };
     bool havePipe = false, haveExtras = false;
     {
@@ -1271,7 +1419,7 @@ void VKAPI_CALL DetourVkCmdDrawIndexedIndirect(VkCommandBuffer cmd, VkBuffer buf
             havePipe = (pit != g_curPipeline.end());
             haveExtras = havePipe && (pe != g_pipeExtras.end());
             if (n++ < 2)
-                Log("2.DrawIndexedIndirect IC: pipe=%d extras=%d hlColor=%p attr=%u stride=%u\n",
+                Log("2.DrawIndexedIndirect IC: pipe=%d extras=%d hlColor=%p attr=%u stride=%u",
                     havePipe, haveExtras, (void*)highlightColor, pAttr, pstride);
 
             auto vit = g_cmdBufVertexInput.find(cmd);
@@ -1286,31 +1434,47 @@ void VKAPI_CALL DetourVkCmdDrawIndexedIndirect(VkCommandBuffer cmd, VkBuffer buf
         auto kit = g_curKey.find(cmd);
         if (kit != g_curKey.end())
             key = kit->second;
+
+        auto it = cmdPushMap.find(cmd);
+        if (it != cmdPushMap.end()) {
+            const PushConstantState& s = it->second;
+            constexpr uint32_t kStableDword = 0;               // set after logging which dword is stable
+            if (s.dirtyMask & (1u << kStableDword)) {          // only use it if it was actually written
+                std::memcpy(&pushword, s.data + kStableDword * 4, sizeof(uint32_t));
+                havePush = true;
+            }
+        }
     }
 
     const uint32_t stride = dstride ? dstride : pstride;
     const uint32_t shortkey = static_cast<uint32_t>(key % 100);
     const uint32_t attrcount = pAttr ? pAttr : dAttr;
+    const uint32_t shortpword = static_cast<uint32_t>(pushword % 100);
 
-    // Model recognition
-    if (shortkey != countstride) //40 = valheim
+    // Model recognition (you are in DrawIndexed_Indirect(2))
+    if (shortkey != countnum)
+        //if(stride != countnum)
+        //if(shortpword != countnum)
+        //if (stride != 40) //valheim
         //if (stride != 28 && stride != 56) //+44? deadlock
         //if (stride != 48) //zomby army 4 (set reversedDepth=true)
         //if (stride != 20 //world war z
         //if (shortkey != 10) //doom 2016
         //if (shortkey != 64) //wolfenstein 2: the new colossus
+        //if (shortkey != 30) //enshrouded
+        //if (shortkey != 18) //doom the dark ages (heavy occlusion ruines wallhack)
     {
         if (pOriginalCmdDrawIndexedIndirect)
             pOriginalCmdDrawIndexedIndirect(cmd, buffer, offset, drawCount, istride);
         return;
     }
 
-    if (logvalues)
+    if (logvaluesonce)
     {
-        //static std::atomic<int> s_infoLogs{ 0 };
-        //if (s_infoLogs.fetch_add(1) < 20)
-        Log("stride == %d && dstride == %d && pstride == %d && shortkey == %d && attrcount == %d",
-            stride, dstride, pstride, shortkey, attrcount);
+        static std::atomic<int> s_infoLogs{ 0 };
+        if (s_infoLogs.fetch_add(1) < 20)
+        Log("2. stride == %d && dstride == %d && pstride == %d && shortkey == %d && attrcount == %d && pushword",
+            stride, dstride, pstride, shortkey, attrcount, pushword);
     }
 
     // ------------------------------------------------------------------
@@ -1413,13 +1577,14 @@ void VKAPI_CALL DetourVkCmdDrawIndexedIndirectCount(
         loggedOnce = true;
     }
 
-    //if game is drawing models in DrawIndexedIndirect, paste code from DrawIndexed here
     VkPipeline original = VK_NULL_HANDLE;
     VkPipeline highlightColor = VK_NULL_HANDLE;
     VkPipeline highlightWall = VK_NULL_HANDLE;
     VkPipeline highlightBoth = VK_NULL_HANDLE;
-    uint32_t dstride = 0, pstride = 0, pAttr = 0, dAttr = 0;
+    uint32_t dstride = 0, pstride = 0, pAttr = 0, dAttr = 0, pushsize = 0;
     uint64_t key = 0;
+    uint32_t pushword = 0;
+    bool havePush = false;
     static std::atomic<int> n{ 0 };
     bool havePipe = false, haveExtras = false;
     {
@@ -1445,7 +1610,7 @@ void VKAPI_CALL DetourVkCmdDrawIndexedIndirectCount(
             havePipe = (pit != g_curPipeline.end());
             haveExtras = havePipe && (pe != g_pipeExtras.end());
             if (n++ < 2)
-                Log("3.DrawIndexedIndirectCount IC: pipe=%d extras=%d hlColor=%p attr=%u stride=%u\n",
+                Log("3.DrawIndexedIndirectCount IC: pipe=%d extras=%d hlColor=%p attr=%u stride=%u",
                     havePipe, haveExtras, (void*)highlightColor, pAttr, pstride);
 
             auto vit = g_cmdBufVertexInput.find(cmd);
@@ -1460,31 +1625,55 @@ void VKAPI_CALL DetourVkCmdDrawIndexedIndirectCount(
         auto kit = g_curKey.find(cmd);
         if (kit != g_curKey.end())
             key = kit->second;
+
+        auto it = cmdPushMap.find(cmd);
+        if (it != cmdPushMap.end()) {
+            const PushConstantState& s = it->second;
+            constexpr uint32_t kStableDword = 0;               // set after logging which dword is stable
+            if (s.dirtyMask & (1u << kStableDword)) {          // only use it if it was actually written
+                std::memcpy(&pushword, s.data + kStableDword * 4, sizeof(uint32_t));
+                havePush = true;
+            }
+        }
     }
 
     const uint32_t stride = dstride ? dstride : pstride;
     const uint32_t shortkey = static_cast<uint32_t>(key % 100);
     const uint32_t attrcount = pAttr ? pAttr : dAttr;
+    const uint32_t shortpword = static_cast<uint32_t>(pushword % 100);
 
-    // Model recognition
-    if (shortkey != countstride) //40 = valheim
+    //if (logvaluesonce)
+    //{
+        //static std::atomic<int> s_infoLogs{ 0 };
+        //if (s_infoLogs.fetch_add(1) < 20)
+            //Log("before3. stride == %d && dstride == %d && pstride == %d && shortkey == %d && attrcount == %d && pushword == %d",
+                //stride, dstride, pstride, shortkey, attrcount, pushword);
+    //}
+
+    // Model recognition (you are in DrawIndexed_Indirect_Count(3))
+    if (shortkey != countnum)
+    //if(stride != countnum)
+    //if(shortpword != countnum)
+        //if (stride != 40) //valheim
         //if (stride != 28 && stride != 56) //+44? deadlock
         //if (stride != 48) //zomby army 4 (set reversedDepth=true)
         //if (stride != 20 //world war z
         //if (shortkey != 10) //doom 2016
         //if (shortkey != 64) //wolfenstein 2: the new colossus
+        //if (shortkey != 30) //enshrouded
+        //if (shortkey != 18) //doom the dark ages (heavy occlusion ruines wallhack)
     {
         if (pOriginalCmdDrawIndexedIndirectCount)
             pOriginalCmdDrawIndexedIndirectCount(cmd, buffer, offset, countBuffer, countBufferOffset, maxDrawCount, istride);
         return;
     }
 
-    if (logvalues)
+    if (logvaluesonce)
     {
-        //static std::atomic<int> s_infoLogs{ 0 };
-        //if (s_infoLogs.fetch_add(1) < 20)
-        Log("stride == %d && dstride == %d && pstride == %d && shortkey == %d && attrcount == %d",
-            stride, dstride, pstride, shortkey, attrcount);
+        static std::atomic<int> s_infoLogs{ 0 };
+        if (s_infoLogs.fetch_add(1) < 20)
+        Log("3. stride == %d && dstride == %d && pstride == %d && shortkey == %d && attrcount == %d && pushword == %d",
+            stride, dstride, pstride, shortkey, attrcount, pushword);
     }
 
     // ------------------------------------------------------------------
@@ -1694,13 +1883,15 @@ void ClearCmdState(VkCommandBuffer cmd)
     {
         std::unique_lock<std::shared_mutex> lock(statesMtx);
         cmdStates.erase(cmd);
+        cmdPushMap.erase(cmd);
     }
 
     std::unique_lock<std::shared_mutex> lock(g_mtx);
+    cmdIndexMap.erase(cmd);
+    g_curPipeline.erase(cmd);
+    g_curKey.erase(cmd);
     g_cmdBufStride.erase(cmd);
     g_cmdBufVertexInput.erase(cmd);
-    g_curKey.erase(cmd);
-    g_curPipeline.erase(cmd);
 }
 
 VkResult VKAPI_CALL DetourVkResetCommandBuffer(VkCommandBuffer commandBuffer,VkCommandBufferResetFlags flags)
@@ -1834,6 +2025,8 @@ static bool HookViaDummyDevice()
         { "vkCmdDrawIndexed",          (void*)DetourVkCmdDrawIndexed,          (void**)&pOriginalCmdDrawIndexed },
         { "vkCmdDrawIndexedIndirect",  (void*)DetourVkCmdDrawIndexedIndirect,  (void**)&pOriginalCmdDrawIndexedIndirect },
         { "vkCmdDrawIndexedIndirectCount",  (void*)DetourVkCmdDrawIndexedIndirectCount,  (void**)&pOriginalCmdDrawIndexedIndirectCount },
+        { "vkCmdPushConstants",        (void*)DetourCmdPushConstants,          (void**)&pOriginalCmdPushConstants },
+        { "vkCmdBindIndexBuffer",      (void*)DetourVkCmdBindIndexBuffer,      (void**)&pOriginalCmdBindIndexBuffer },
         { "vkDestroyPipeline",         (void*)DetourVkDestroyPipeline,         (void**)&pOriginalDestroyPipeline },
         { "vkResetCommandBuffer",      (void*)DetourVkResetCommandBuffer,      (void**)&pOriginalResetCommandBuffer },
         { "vkFreeCommandBuffers",      (void*)DetourVkFreeCommandBuffers,      (void**)&pOriginalFreeCommandBuffers },
@@ -1941,9 +2134,9 @@ DWORD WINAPI HookThread(LPVOID)
 DWORD WINAPI InputThread(LPVOID lpParam) {
     bool p1 = false, p2 = false, p3 = false;
     while (true) {
-        if (GetAsyncKeyState(VK_OEM_COMMA) & 1) { countstride--; }
-        if (GetAsyncKeyState(VK_OEM_PERIOD) & 1) { countstride++; }
-        if (GetAsyncKeyState(VK_OEM_MINUS) & 1) { countstride = -1; }
+        if (GetAsyncKeyState(VK_OEM_COMMA) & 1) { countnum--; }
+        if (GetAsyncKeyState(VK_OEM_PERIOD) & 1) { countnum++; }
+        if (GetAsyncKeyState(VK_OEM_MINUS) & 1) { countnum = -1; }
 
         bool c1 = GetAsyncKeyState(VK_F3) & 0x8000;
         bool c2 = GetAsyncKeyState(VK_F4) & 0x8000;
@@ -1951,7 +2144,7 @@ DWORD WINAPI InputThread(LPVOID lpParam) {
 
         if (c1 && !p1) Wallwurst = !Wallwurst;   
         if (c2 && !p2) colorhack = !colorhack;
-        if (c3 && !p3) logvalues = !logvalues;
+        if (c3 && !p3) logvaluesonce = !logvaluesonce;
 
         p1 = c1; p2 = c2, p3 = c3;
         Sleep(2);

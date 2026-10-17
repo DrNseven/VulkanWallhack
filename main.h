@@ -226,31 +226,85 @@ static const uint32_t CustomFragmentShader[] = {
 
 /*
 // occusion culling exploit untested and game specific
-typedef VkResult(VKAPI_PTR* PFN_vkCreateQueryPool)(VkDevice device, const VkQueryPoolCreateInfo* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkQueryPool* pQueryPool);
-static PFN_vkCreateQueryPool Original_vkCreateQueryPool = nullptr;
+typedef VkResult(VKAPI_PTR* PFN_CustomGetQueryPoolResults)(
+    VkDevice device,
+    VkQueryPool queryPool,
+    uint32_t firstQuery,
+    uint32_t queryCount,
+    size_t dataSize,
+    void* pData,
+    VkDeviceSize stride,
+    VkQueryResultFlags flags
+    );
 
-VkResult Hooked_vkCreateQueryPool(VkDevice device, const VkQueryPoolCreateInfo* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkQueryPool* pQueryPool) {
-    if (pCreateInfo->queryType == VK_QUERY_TYPE_OCCLUSION) {
-        // Modify the query pool creation info to use a timestamp query instead.
-        VkQueryPoolCreateInfo modifiedCreateInfo = *pCreateInfo; // Copy the original
-        modifiedCreateInfo.queryType = VK_QUERY_TYPE_TIMESTAMP; // Change query type
-        modifiedCreateInfo.pipelineStatistics = 0; // Important: clear this
+PFN_CustomGetQueryPoolResults pOriginalGetQueryPoolResults = nullptr;
 
-        //Log("Replaced OCCLUSION query with TIMESTAMP query.");
-        return Original_vkCreateQueryPool(device, &modifiedCreateInfo, pAllocator, pQueryPool);
+VkResult DetourVkGetQueryPoolResults(VkDevice device, VkQueryPool queryPool, uint32_t firstQuery, uint32_t queryCount, size_t dataSize, void* pData, VkDeviceSize stride, VkQueryResultFlags flags) {
+
+    static bool loggedOnce = false;
+    if (!loggedOnce) {
+        Log("GetQueryPoolResults");
+        loggedOnce = true;
     }
-    else if (pCreateInfo->queryType == VK_QUERY_TYPE_PIPELINE_STATISTICS && (pCreateInfo->pipelineStatistics & VK_QUERY_PIPELINE_STATISTIC_INPUT_ASSEMBLY_VERTICES_BIT))
+
+    VkResult result = pOriginalGetQueryPoolResults(device, queryPool, firstQuery, queryCount, dataSize, pData, stride, flags);
+
+    // Check if this pool is one of our Occlusion pools
+    bool isOcclusion = false;
     {
-        VkQueryPoolCreateInfo modifiedCreateInfo = *pCreateInfo; // Copy the original
-        modifiedCreateInfo.queryType = VK_QUERY_TYPE_TIMESTAMP; // Change query type
-        modifiedCreateInfo.pipelineStatistics = 0; // Important: clear this
-
-        //Log("Replaced PIPELINE query with TIMESTAMP query.");
-        return Original_vkCreateQueryPool(device, &modifiedCreateInfo, pAllocator, pQueryPool);
+        std::lock_guard<std::mutex> lock(g_PoolMutex);
+        if (g_OcclusionPools.find(queryPool) != g_OcclusionPools.end()) {
+            isOcclusion = true;
+        }
     }
 
-    // For other query types, just call the original function.
-    return Original_vkCreateQueryPool(device, pCreateInfo, pAllocator, pQueryPool);
+    // Surgical Filter:
+    // 1. Must be an occlusion pool.
+    // 2. Occlusion batches are usually large. Exposure is usually 1 or 2 queries.
+    if (result >= 0 && isOcclusion && queryCount > 2) {
+        uint8_t* pRawData = (uint8_t*)pData;
+        bool is64Bit = (flags & VK_QUERY_RESULT_64_BIT) != 0;
+        bool hasAvail = (flags & VK_QUERY_RESULT_WITH_AVAILABILITY_BIT) != 0;
+        VkDeviceSize actualStride = (stride > 0) ? stride : (is64Bit ? 8 : 4);
+
+        for (uint32_t i = 0; i < queryCount; ++i) {
+            uint8_t* pEntry = pRawData + (i * actualStride);
+
+            // Stay inside the game's buffer
+            if ((size_t)(pEntry - pRawData) + (is64Bit ? 8 : 4) > dataSize) break;
+
+            if (is64Bit) {
+                // 1 is the magic number. It means "Visible" but doesn't
+                // overflow any internal engine multipliers.
+                *(uint64_t*)pEntry = 1;
+                if (hasAvail && (size_t)(pEntry - pRawData) + 16 <= dataSize) {
+                    *(uint64_t*)(pEntry + 8) = 1; // Mark as Ready
+
+                    static bool loggedOnce = false;
+                    if (!loggedOnce) {
+                        Log("is64Bit");
+                        loggedOnce = true;
+                    }
+                }
+            }
+            else {
+                *(uint32_t*)pEntry = 1;
+                if (hasAvail && (size_t)(pEntry - pRawData) + 8 <= dataSize) {
+                    *(uint32_t*)(pEntry + 4) = 1; // Mark as Ready
+
+                    static bool loggedOnce = false;
+                    if (!loggedOnce) {
+                        Log("else");
+                        loggedOnce = true;
+                    }
+                }
+            }
+        }
+        // Tell the engine everything is perfect
+        return VK_SUCCESS;
+    }
+
+    return result;
 }
 */
 
