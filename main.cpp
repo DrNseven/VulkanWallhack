@@ -1734,7 +1734,8 @@ void VKAPI_CALL DetourVkCmdDrawIndexed(VkCommandBuffer cmd, uint32_t idxCount, u
     VkPipeline highlightColor = VK_NULL_HANDLE;
     VkPipeline highlightWall = VK_NULL_HANDLE;
     VkPipeline highlightBoth = VK_NULL_HANDLE;
-    uint32_t dstride = 0, pstride0 = 0, pstride1 = 0, pstride2 = 0, pstride3 = 0, pstride4 = 0, pAttr = 0, dAttr = 0, pushsize = 0;
+    uint32_t dstride = 0, pstride = 0; 
+    uint32_t pstride0 = 0, pstride1 = 0, pstride2 = 0, pstride3 = 0, pstride4 = 0, pAttr = 0, dAttr = 0, pushsize = 0;
     uint64_t key = 0;
     uint32_t pushword = 0;
     uint32_t dsetcount = 0;
@@ -1759,11 +1760,12 @@ void VKAPI_CALL DetourVkCmdDrawIndexed(VkCommandBuffer cmd, uint32_t idxCount, u
                 highlightColor = e.hl[HLM_COLOR];
                 highlightWall = e.hl[HLM_WALL];
                 highlightBoth = e.hl[HLM_BOTH];
+                pstride = e.stride;
                 if (e.bindingMask & (1u << 0)) pstride0 = e.strides[0];
                 if (e.bindingMask & (1u << 1)) pstride1 = e.strides[1];
-                if (e.bindingMask & (1u << 2)) pstride1 = e.strides[2];
-                if (e.bindingMask & (1u << 3)) pstride1 = e.strides[3];
-                if (e.bindingMask & (1u << 4)) pstride1 = e.strides[4];
+                if (e.bindingMask & (1u << 2)) pstride2 = e.strides[2];
+                if (e.bindingMask & (1u << 3)) pstride3 = e.strides[3];
+                if (e.bindingMask & (1u << 4)) pstride4 = e.strides[4];
                 pAttr = e.attrCount;
                 // key often already on g_curKey; can also use e.key
             }
@@ -1802,7 +1804,7 @@ void VKAPI_CALL DetourVkCmdDrawIndexed(VkCommandBuffer cmd, uint32_t idxCount, u
         dsetcount = dit->second.descriptorSetCount;
     }
 
-    const uint32_t stride = dstride ? dstride : pstride0;
+    const uint32_t stride = dstride ? dstride : pstride;
     const uint32_t shortkey = static_cast<uint32_t>(key % 100);
     const uint32_t attrcount = pAttr ? pAttr : dAttr;
     const uint32_t shortpword = static_cast<uint32_t>(pushword % 100);
