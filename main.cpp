@@ -25,7 +25,7 @@
 //===================================================================================================//
 
 // Globals
-int countnum = 30; //40 = valheim, 48 = zombie army 4: dead war(reversedDepth=true), 28/56 = deadlock
+int countnum = -1; //40 = valheim, 48 = zombie army 4: dead war(reversedDepth=true), 28/56 = deadlock
 std::atomic<bool> Wallwurst{ true };
 std::atomic<bool> colorhack{ true };
 std::atomic<bool> logvaluesonce{ false };
@@ -574,6 +574,14 @@ VKAPI_ATTR VkResult VKAPI_CALL DetourVkCreateGraphicsPipelines(
             ownAttrCount = vis->vertexAttributeDescriptionCount;
             ownBindingCount = vis->vertexBindingDescriptionCount;
 
+            //Log("bindingCount=%u attrCount=%u", ownBindingCount, ownAttrCount);
+
+            //for (uint32_t i = 0; i < vis->vertexBindingDescriptionCount; ++i)
+            //{
+                //const auto& b = vis->pVertexBindingDescriptions[i];
+                //Log("binding[%u]: binding=%u stride=%u rate=%u", i, b.binding, b.stride, b.inputRate);
+            //}
+
             if (!strideDyn && vis->pVertexBindingDescriptions && vis->vertexBindingDescriptionCount > 0)
             {
                 uint32_t primary = vis->pVertexBindingDescriptions[0].binding;
@@ -590,6 +598,7 @@ VKAPI_ATTR VkResult VKAPI_CALL DetourVkCreateGraphicsPipelines(
                 }
             }
         }
+
 
         const uint32_t stride = ownsVI ? ownStride : libStride;
         const uint32_t attrCount = ownsVI ? ownAttrCount : libAttrCount;
@@ -929,34 +938,6 @@ void VKAPI_CALL DetourVkCmdBindPipeline(VkCommandBuffer cmd, VkPipelineBindPoint
 
 //===================================================================================================//
 
-struct IndexState {
-    VkBuffer buffer;
-    VkIndexType type;
-    VkDeviceSize offset;
-};
-std::unordered_map<VkCommandBuffer, IndexState> cmdIndexMap;
-
-typedef void (VKAPI_PTR* PFN_vkCmdBindIndexBuffer)(VkCommandBuffer cmd, VkBuffer buffer, VkDeviceSize offset, VkIndexType indexType);
-PFN_vkCmdBindIndexBuffer pOriginalCmdBindIndexBuffer = nullptr;
-
-void VKAPI_CALL DetourVkCmdBindIndexBuffer(VkCommandBuffer cmd, VkBuffer buffer, VkDeviceSize offset, VkIndexType indexType) {
-
-    static bool loggedOnce = false;
-    if (!loggedOnce) {
-        Log("VkCmdBindIndexBuffer");
-        loggedOnce = true;
-    }
-
-    {
-        std::unique_lock<std::shared_mutex> lock(g_mtx);
-        cmdIndexMap[cmd] = { buffer, indexType, offset };
-    }
-
-    pOriginalCmdBindIndexBuffer(cmd, buffer, offset, indexType);
-}
-
-//===================================================================================================//
-
 typedef void (VKAPI_PTR* PFN_vkCmdPushConstants)(VkCommandBuffer, VkPipelineLayout, VkShaderStageFlags, uint32_t, uint32_t, const void*);
 PFN_vkCmdPushConstants pOriginalCmdPushConstants = nullptr;
 
@@ -970,6 +951,12 @@ std::unordered_map<VkCommandBuffer, PushConstantState> cmdPushMap;
 void VKAPI_CALL DetourCmdPushConstants(VkCommandBuffer cb, VkPipelineLayout layout,
     VkShaderStageFlags stages, uint32_t offset, uint32_t size, const void* pValues)
 {
+    static bool loggedOnce = false;
+    if (!loggedOnce) {
+        Log("DetourCmdPushConstants");
+        loggedOnce = true;
+    }
+
     if (pValues && offset + size <= sizeof(PushConstantState::data)) {
         std::unique_lock<std::shared_mutex> lock(statesMtx);
         auto& s = cmdPushMap[cb];
@@ -980,82 +967,46 @@ void VKAPI_CALL DetourCmdPushConstants(VkCommandBuffer cb, VkPipelineLayout layo
     pOriginalCmdPushConstants(cb, layout, stages, offset, size, pValues);
 }
 
-/*
-struct PushConstantState {
-    uint32_t size = 0;       // Number of bytes passed to Vulkan
-    uint32_t offset = 0;          // Push-constant destination offset
-    VkShaderStageFlags stages = 0;
-    uint32_t firstWord = 0;       // First 4 bytes, if available
-    bool hasFirstWord = false;
+//===================================================================================================//
+
+typedef VkResult(VKAPI_PTR* PFN_vkCreateBuffer)(VkDevice device, const VkBufferCreateInfo* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkBuffer* pBuffer);
+PFN_vkCreateBuffer pOriginalCreateBuffer = nullptr;
+
+struct BufferInfo {
+    VkDeviceSize size;
+    VkBufferUsageFlags usage;
 };
+std::unordered_map<VkBuffer, BufferInfo> g_bufferInfo;   // guarded by g_mtx
 
-std::unordered_map<VkCommandBuffer, PushConstantState> cmdPushMap;
-
-void VKAPI_CALL DetourCmdPushConstants(
-    VkCommandBuffer commandBuffer,
-    VkPipelineLayout layout,
-    VkShaderStageFlags stageFlags,
-    uint32_t offset,
-    uint32_t size,
-    const void* pValues)
-{
-    PushConstantState next{};
-    next.size = size;
-    next.offset = offset;
-    next.stages = stageFlags;
-
-    if (pValues && size >= sizeof(next.firstWord)) {
-        std::memcpy(
-            &next.firstWord,
-            pValues,
-            sizeof(next.firstWord));
-        next.hasFirstWord = true;
-    }
-
-    {
-        std::unique_lock<std::shared_mutex> lock(statesMtx);
-        cmdPushMap[commandBuffer] = next;
-    }
-
-    if (pOriginalCmdPushConstants) {
-        pOriginalCmdPushConstants(
-            commandBuffer, layout, stageFlags, offset, size, pValues);
-    }
-}
-*/
-
-/*
-void VKAPI_CALL DetourCmdPushConstants(
-    VkCommandBuffer commandBuffer,
-    VkPipelineLayout layout,
-    VkShaderStageFlags stageFlags,
-    uint32_t offset,
-    uint32_t size,
-    const void* pValues)
+VkResult VKAPI_CALL DetourVkCreateBuffer(VkDevice device, const VkBufferCreateInfo* ci,
+    const VkAllocationCallbacks* alloc, VkBuffer* pBuffer)
 {
     static bool loggedOnce = false;
     if (!loggedOnce) {
-        Log("vkCmdPushConstants");
+        Log("DetourVkCreateBuffer");
         loggedOnce = true;
     }
+    VkResult r = pOriginalCreateBuffer(device, ci, alloc, pBuffer);
+    if (r == VK_SUCCESS) {
+        std::unique_lock<std::shared_mutex> lock(g_mtx);
+        g_bufferInfo[*pBuffer] = { ci->size, ci->usage };
+    }
+    return r;
+}
+/*
+typedef VkResult(VKAPI_PTR* PFN_vkDestroyBuffer)(VkDevice device, VkBuffer buf, const VkAllocationCallbacks* alloc);
+PFN_vkDestroyBuffer pOriginalDestroyBuffer = nullptr;
 
-        std::unique_lock<std::shared_mutex> lock(statesMtx);
-
-        auto& state = cmdPushMap[commandBuffer];
-
-        state.size = size;
-        state.offset = offset;
-        state.stages = stageFlags;
-        state.hasFirstWord = size >= sizeof(uint32_t) && pValues != nullptr;
-
-        if (offset == 0 && state.hasFirstWord) {
-            std::memcpy(&state.firstWord, pValues, sizeof(state.firstWord));
-        }
-
-    pOriginalCmdPushConstants(commandBuffer, layout, stageFlags, offset, size, pValues);
+void VKAPI_CALL DetourVkDestroyBuffer(VkDevice device, VkBuffer buf, const VkAllocationCallbacks* alloc)
+{
+    Log("2");
+    if (buf) {
+        std::unique_lock<std::shared_mutex> lock(g_mtx);
+        g_bufferInfo.erase(buf);     // handles can be reused
+    }
+    pOriginalDestroyBuffer(device, buf, alloc);
 }
 */
-
 //===================================================================================================//
 
 void VKAPI_CALL DetourVkCmdSetViewport(VkCommandBuffer cmd, uint32_t first, uint32_t count, const VkViewport* pVp) {
@@ -1104,6 +1055,10 @@ void VKAPI_CALL DetourVkCmdSetViewportWithCount(VkCommandBuffer cmd, uint32_t co
 
 //===================================================================================================//
 
+//vkCmdSetVertexInputEXT	VkVertexInputBindingDescription2EXT::stride
+//vkCmdBindVertexBuffers2	pStrides[]
+//vkCmdBindVertexBuffers2EXT	pStrides[]
+//vkCmdBindVertexBuffers3KHR	VkBindVertexBuffer3InfoKHR::addressRange.stride
 void VKAPI_CALL DetourVkCmdSetVertexInputEXT(
     VkCommandBuffer cmd,
     uint32_t bindingCount, const VkVertexInputBindingDescription2EXT* pBindings,
@@ -1132,10 +1087,41 @@ void VKAPI_CALL DetourVkCmdSetVertexInputEXT(
         }
     }
 
-    // never call into the driver while holding g_mtx
     pOriginalCmdSetVertexInputEXT(cmd, bindingCount, pBindings, attrCount, pAttrs);
 }
 
+//===================================================================================================//
+struct DescState {
+    VkPipelineLayout layout = VK_NULL_HANDLE;
+    uint32_t descriptorSetCount = 0;
+};
+
+std::unordered_map<VkCommandBuffer, DescState> cmdDescMap;
+
+void VKAPI_CALL DetourVkCmdBindDescriptorSets(
+    VkCommandBuffer cmd, VkPipelineBindPoint bindPoint, VkPipelineLayout layout,
+    uint32_t firstSet, uint32_t descriptorSetCount, const VkDescriptorSet* pSets,
+    uint32_t dynamicOffsetCount, const uint32_t* pDynamicOffsets)
+{
+    static bool loggedOnce = false;
+    if (!loggedOnce) {
+        Log("DetourVkCmdBindDescriptorSets");
+        loggedOnce = true;
+    }
+
+    if (bindPoint == VK_PIPELINE_BIND_POINT_GRAPHICS) {
+        std::unique_lock<std::shared_mutex> lock(g_mtx);
+        cmdDescMap.reserve(4096);
+
+        auto& ds = cmdDescMap[cmd];
+        ds.layout = layout;
+        ds.descriptorSetCount = descriptorSetCount;
+    }
+
+    pOriginalCmdBindDescriptorSets(cmd, bindPoint, layout, firstSet, descriptorSetCount,
+        pSets, dynamicOffsetCount, pDynamicOffsets);
+}
+ 
 //===================================================================================================//
 
 void VKAPI_CALL DetourVkCmdDrawIndexed(VkCommandBuffer cmd, uint32_t idxCount, uint32_t instCount, uint32_t firstIdx, int32_t vtxOff, uint32_t firstInst)
@@ -1151,10 +1137,13 @@ void VKAPI_CALL DetourVkCmdDrawIndexed(VkCommandBuffer cmd, uint32_t idxCount, u
     VkPipeline highlightColor = VK_NULL_HANDLE;
     VkPipeline highlightWall = VK_NULL_HANDLE;
     VkPipeline highlightBoth = VK_NULL_HANDLE;
-    uint32_t dstride = 0, pstride = 0, pAttr = 0, dAttr = 0;
+    uint32_t dstride = 0, pstride = 0, pAttr = 0, dAttr = 0, pushsize = 0;
     uint64_t key = 0;
     uint32_t pushword = 0;
-    bool havePush = false;
+    uint32_t dsetcount = 0;
+    VkPipelineLayout layout = VK_NULL_HANDLE;
+    BufferInfo indirect{}, count{};
+    bool haveIndirect = false, haveCount = false, havePush = false;
     static std::atomic<int> n{ 0 };
     bool havePipe = false, haveExtras = false;
     {
@@ -1205,123 +1194,128 @@ void VKAPI_CALL DetourVkCmdDrawIndexed(VkCommandBuffer cmd, uint32_t idxCount, u
                 havePush = true;
             }
         }
+
+        auto dit = cmdDescMap.find(cmd);
+        if (dit != cmdDescMap.end())
+            layout = dit->second.layout;
+        dsetcount = dit->second.descriptorSetCount;
     }
 
     const uint32_t stride = dstride ? dstride : pstride;
     const uint32_t shortkey = static_cast<uint32_t>(key % 100);
     const uint32_t attrcount = pAttr ? pAttr : dAttr;
     const uint32_t shortpword = static_cast<uint32_t>(pushword % 100);
-   
+    const uint32_t shortlayout = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(layout) % 100);
+    
+    
     // Model recognition (you are in DrawIndexed(1))
-    if (shortkey != countnum)
-        //if(stride != countnum)
-        //if(shortpword != countnum)
-        //if (stride != 40) //valheim
-        //if (stride != 28 && stride != 56) //+44? deadlock
-        //if (stride != 48) //zomby army 4 (set reversedDepth=true)
-        //if (stride != 20 //world war z
-        //if (shortkey != 10) //doom 2016
-        //if (shortkey != 64) //wolfenstein 2: the new colossus
-        //if (shortkey != 30) //enshrouded
-        //if (shortkey != 18) //doom the dark ages (heavy occlusion ruines wallhack)
+    if (shortkey == countnum)
+    //if(stride == countnum)
+    //if(shortpword == countnum)
+    //if (shortlayout + dsetcount == countnum)
+    //if (stride == 40) //valheim
+    //if (stride == 28 && stride != 56) //+44? deadlock
+    //if (stride == 48) //zomby army 4 (set reversedDepth=true)
+    //if (stride == 48 && shortkey==4 && attrcount==11 && dsetcount==1 && shortlayout==64)//4, 46
+    //if (stride == 20 //world war z
+    //if (shortkey == 10) //doom 2016
+    //if (shortkey == 64) //wolfenstein 2: the new colossus
+    //if (shortkey == 30) //enshrouded
+    //if (shortkey == 18) //doom the dark ages (heavy occlusion ruines wallhack)
     {
+
+        if (logvaluesonce)
+        {
+            static std::atomic<int> s_infoLogs{ 0 };
+            if (s_infoLogs.fetch_add(1) < 20)
+                Log("1. stride == %d && dstride == %d && pstride == %d && shortkey == %d && attrcount == %d && idxCount == %d && shortpword == %d && shortlayout == %d",
+                    stride, dstride, pstride, shortkey, attrcount, idxCount, shortpword, shortlayout);
+        }
+
+        // ------------------------------------------------------------------
+        // Capture viewport
+        // ------------------------------------------------------------------
+        bool hasVp = false;
+        CmdState localState{};
+        {
+            std::shared_lock<std::shared_mutex> lock(statesMtx);
+            auto it = cmdStates.find(cmd);
+            if (it != cmdStates.end() && it->second.hasViewport)
+            {
+                localState = it->second;
+                hasVp = true;
+            }
+        }
+
+
+        bool wantColor = colorhack && (highlightColor != VK_NULL_HANDLE || highlightBoth != VK_NULL_HANDLE);
+        bool wantWall = Wallwurst && (highlightWall != VK_NULL_HANDLE || highlightBoth != VK_NULL_HANDLE);
+
+        // 1) normal draw
         if (pOriginalCmdDrawIndexed)
             pOriginalCmdDrawIndexed(cmd, idxCount, instCount, firstIdx, vtxOff, firstInst);
-        return;
-    }
 
-    if (logvaluesonce)
-    {
-        static std::atomic<int> s_infoLogs{ 0 };
-        if (s_infoLogs.fetch_add(1) < 20)
-        Log("1. stride == %d && dstride == %d && pstride == %d && shortkey == %d && attrcount == %d && idxCount == %d && shortpword == %d",
-            stride, dstride, pstride, shortkey, attrcount, idxCount, shortpword);
-    }
-
-    // ------------------------------------------------------------------
-    // Capture viewport
-    // ------------------------------------------------------------------
-    bool hasVp = false;
-    CmdState localState{};
-    {
-        std::shared_lock<std::shared_mutex> lock(statesMtx);
-        auto it = cmdStates.find(cmd);
-        if (it != cmdStates.end() && it->second.hasViewport)
+        //same color behind and infront of walls
+        if (wantWall || wantColor)
         {
-            localState = it->second;
-            hasVp = true;
-        }
-    }
+            auto applyWallViewport = [&]()
+                {
+                    if (!pOriginalCmdSetViewport || !hasVp) return;
+                    VkViewport hVp = localState.currentViewport;
+                    constexpr bool reversedDepth = true; //false;   // set true if game uses reversed-Z (zombie army 4)
+                    hVp.minDepth = reversedDepth ? 0.0f : 0.9f;
+                    hVp.maxDepth = reversedDepth ? 0.1f : 1.0f;
+                    pOriginalCmdSetViewport(cmd, 0, 1, &hVp);
+                };
+            auto restoreViewport = [&]()
+                {
+                    if (pOriginalCmdSetViewport && hasVp)
+                        pOriginalCmdSetViewport(cmd, localState.firstViewport, 1, &localState.currentViewport);
+                };
 
-
-    bool wantColor = colorhack && (highlightColor != VK_NULL_HANDLE || highlightBoth != VK_NULL_HANDLE);
-    bool wantWall = Wallwurst && (highlightWall != VK_NULL_HANDLE || highlightBoth != VK_NULL_HANDLE);
-
-    // 1) normal draw
-    if (pOriginalCmdDrawIndexed)
-        pOriginalCmdDrawIndexed(cmd, idxCount, instCount, firstIdx, vtxOff, firstInst);
-
-    //same color behind and infront of walls
-    if (wantWall || wantColor)
-    {
-        auto applyWallViewport = [&]()
+            // --- Wall only ---
+            if (wantWall && !wantColor)
             {
-                if (!pOriginalCmdSetViewport || !hasVp) return;
-                VkViewport hVp = localState.currentViewport;
-                constexpr bool reversedDepth = false;   // set true if game uses reversed-Z (zombie army 4)
-                hVp.minDepth = reversedDepth ? 0.0f : 0.9f;
-                hVp.maxDepth = reversedDepth ? 0.1f : 1.0f;
-                pOriginalCmdSetViewport(cmd, 0, 1, &hVp);
-            };
-        auto restoreViewport = [&]()
+                applyWallViewport();
+                if (highlightWall && pOriginalCmdBindPipeline)
+                    pOriginalCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, highlightWall);
+                if (pOriginalCmdDrawIndexed)
+                    pOriginalCmdDrawIndexed(cmd, idxCount, instCount, firstIdx, vtxOff, firstInst);
+                restoreViewport();
+            }
+            // --- Colour only ---
+            else if (wantColor && !wantWall)
             {
-                if (pOriginalCmdSetViewport && hasVp)
-                    pOriginalCmdSetViewport(cmd, localState.firstViewport, 1, &localState.currentViewport);
-            };
+                if (highlightColor && pOriginalCmdBindPipeline)
+                    pOriginalCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, highlightColor);
+                if (pOriginalCmdDrawIndexed)
+                    pOriginalCmdDrawIndexed(cmd, idxCount, instCount, firstIdx, vtxOff, firstInst);
+            }
+            // --- Both: wallhack first (full punch), then colour through walls ---
+            else if (wantWall && wantColor)
+            {
+                applyWallViewport();
 
-        // --- Wall only ---
-        if (wantWall && !wantColor)
-        {
-            applyWallViewport();
-            if (highlightWall && pOriginalCmdBindPipeline)
-                pOriginalCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, highlightWall);
-            if (pOriginalCmdDrawIndexed)
-                pOriginalCmdDrawIndexed(cmd, idxCount, instCount, firstIdx, vtxOff, firstInst);
-            restoreViewport();
+                // 1) same solid wallhack as wall-only
+                if (highlightWall && pOriginalCmdBindPipeline)
+                    pOriginalCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, highlightWall);
+                if (pOriginalCmdDrawIndexed)
+                    pOriginalCmdDrawIndexed(cmd, idxCount, instCount, firstIdx, vtxOff, firstInst);
+
+                // 2) red overlay, still depth-off (keep viewport)
+                VkPipeline colorPipe = highlightBoth ? highlightBoth : highlightColor;
+                if (colorPipe && pOriginalCmdBindPipeline)
+                    pOriginalCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, colorPipe);
+                if (pOriginalCmdDrawIndexed)
+                    pOriginalCmdDrawIndexed(cmd, idxCount, instCount, firstIdx, vtxOff, firstInst);
+
+                restoreViewport();
+            }
+
+            if (original && pOriginalCmdBindPipeline)
+                pOriginalCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, original);
         }
-        // --- Colour only ---
-        else if (wantColor && !wantWall)
-        {
-            if (highlightColor && pOriginalCmdBindPipeline)
-                pOriginalCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, highlightColor);
-            if (pOriginalCmdDrawIndexed)
-                pOriginalCmdDrawIndexed(cmd, idxCount, instCount, firstIdx, vtxOff, firstInst);
-        }
-        // --- Both: wallhack first (full punch), then colour through walls ---
-        else if (wantWall && wantColor)
-        {
-            applyWallViewport();
-
-            // 1) same solid wallhack as wall-only
-            if (highlightWall && pOriginalCmdBindPipeline)
-                pOriginalCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, highlightWall);
-            if (pOriginalCmdDrawIndexed)
-                pOriginalCmdDrawIndexed(cmd, idxCount, instCount, firstIdx, vtxOff, firstInst);
-
-            // 2) red overlay, still depth-off (keep viewport)
-            VkPipeline colorPipe = highlightBoth ? highlightBoth : highlightColor;
-            if (colorPipe && pOriginalCmdBindPipeline)
-                pOriginalCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, colorPipe);
-            if (pOriginalCmdDrawIndexed)
-                pOriginalCmdDrawIndexed(cmd, idxCount, instCount, firstIdx, vtxOff, firstInst);
-
-            restoreViewport();
-        }
-
-        if (original && pOriginalCmdBindPipeline)
-            pOriginalCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, original);
     }
-    
 
     /*
     //chams effect, no color behind walls
@@ -1373,7 +1367,8 @@ void VKAPI_CALL DetourVkCmdDrawIndexed(VkCommandBuffer cmd, uint32_t idxCount, u
                 cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, original);
     }
     */
-    //return pOriginalCmdDrawIndexed(cmd, idxCount, instCount, firstIdx, vtxOff, firstInst);
+
+    return pOriginalCmdDrawIndexed(cmd, idxCount, instCount, firstIdx, vtxOff, firstInst);
 }
 
 //===================================================================================================//
@@ -1390,10 +1385,13 @@ void VKAPI_CALL DetourVkCmdDrawIndexedIndirect(VkCommandBuffer cmd, VkBuffer buf
     VkPipeline highlightColor = VK_NULL_HANDLE;
     VkPipeline highlightWall = VK_NULL_HANDLE;
     VkPipeline highlightBoth = VK_NULL_HANDLE;
-    uint32_t dstride = 0, pstride = 0, pAttr = 0, dAttr = 0;
+    uint32_t dstride = 0, pstride = 0, pAttr = 0, dAttr = 0, pushsize = 0;
     uint64_t key = 0;
     uint32_t pushword = 0;
-    bool havePush = false;
+    uint32_t dsetcount = 0;
+    VkPipelineLayout layout = VK_NULL_HANDLE;
+    BufferInfo indirect{}, count{};
+    bool haveIndirect = false, haveCount = false, havePush = false;
     static std::atomic<int> n{ 0 };
     bool havePipe = false, haveExtras = false;
     {
@@ -1444,17 +1442,31 @@ void VKAPI_CALL DetourVkCmdDrawIndexedIndirect(VkCommandBuffer cmd, VkBuffer buf
                 havePush = true;
             }
         }
-    }
 
+        auto itI = g_bufferInfo.find(buffer);
+        if (itI != g_bufferInfo.end()) {
+            indirect = itI->second;
+            haveIndirect = true;
+        }
+
+        auto dit = cmdDescMap.find(cmd);
+        if (dit != cmdDescMap.end())
+            layout = dit->second.layout;
+        dsetcount = dit->second.descriptorSetCount;
+    }
+    
     const uint32_t stride = dstride ? dstride : pstride;
     const uint32_t shortkey = static_cast<uint32_t>(key % 100);
     const uint32_t attrcount = pAttr ? pAttr : dAttr;
     const uint32_t shortpword = static_cast<uint32_t>(pushword % 100);
+    const uint32_t shortlayout = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(layout) % 100);
 
     // Model recognition (you are in DrawIndexed_Indirect(2))
     if (shortkey != countnum)
         //if(stride != countnum)
         //if(shortpword != countnum)
+        //if(indirect.size != countnum)
+        //if (shortlayout + dsetcount != countnum)
         //if (stride != 40) //valheim
         //if (stride != 28 && stride != 56) //+44? deadlock
         //if (stride != 48) //zomby army 4 (set reversedDepth=true)
@@ -1473,8 +1485,8 @@ void VKAPI_CALL DetourVkCmdDrawIndexedIndirect(VkCommandBuffer cmd, VkBuffer buf
     {
         static std::atomic<int> s_infoLogs{ 0 };
         if (s_infoLogs.fetch_add(1) < 20)
-        Log("2. stride == %d && dstride == %d && pstride == %d && shortkey == %d && attrcount == %d && pushword",
-            stride, dstride, pstride, shortkey, attrcount, pushword);
+            Log("2. stride == %d && dstride == %d && pstride == %d && shortkey == %d && attrcount == %d && istride == %d && shortpword == %d && shortlayout == %d && indirect.size == %d",
+                stride, dstride, pstride, shortkey, attrcount, istride, shortpword, shortlayout, indirect.size);
     }
 
     // ------------------------------------------------------------------
@@ -1584,7 +1596,10 @@ void VKAPI_CALL DetourVkCmdDrawIndexedIndirectCount(
     uint32_t dstride = 0, pstride = 0, pAttr = 0, dAttr = 0, pushsize = 0;
     uint64_t key = 0;
     uint32_t pushword = 0;
-    bool havePush = false;
+    uint32_t dsetcount = 0;
+    VkPipelineLayout layout = VK_NULL_HANDLE;
+    BufferInfo indirect{}, count{};
+    bool haveIndirect = false, haveCount = false, havePush = false;
     static std::atomic<int> n{ 0 };
     bool havePipe = false, haveExtras = false;
     {
@@ -1635,25 +1650,37 @@ void VKAPI_CALL DetourVkCmdDrawIndexedIndirectCount(
                 havePush = true;
             }
         }
-    }
+    
+        auto itI = g_bufferInfo.find(buffer);
+        if (itI != g_bufferInfo.end()) {
+            indirect = itI->second;
+            haveIndirect = true;
+        }
 
+        auto itC = g_bufferInfo.find(countBuffer);
+        if (itC != g_bufferInfo.end()) {
+            count = itC->second;
+            haveCount = true;
+        }
+        
+        auto dit = cmdDescMap.find(cmd);
+        if (dit != cmdDescMap.end())
+            layout = dit->second.layout;
+        dsetcount = dit->second.descriptorSetCount;
+    }
+    
     const uint32_t stride = dstride ? dstride : pstride;
     const uint32_t shortkey = static_cast<uint32_t>(key % 100);
     const uint32_t attrcount = pAttr ? pAttr : dAttr;
     const uint32_t shortpword = static_cast<uint32_t>(pushword % 100);
+    const uint32_t shortlayout = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(layout) % 100);
 
-    //if (logvaluesonce)
-    //{
-        //static std::atomic<int> s_infoLogs{ 0 };
-        //if (s_infoLogs.fetch_add(1) < 20)
-            //Log("before3. stride == %d && dstride == %d && pstride == %d && shortkey == %d && attrcount == %d && pushword == %d",
-                //stride, dstride, pstride, shortkey, attrcount, pushword);
-    //}
 
-    // Model recognition (you are in DrawIndexed_Indirect_Count(3))
     if (shortkey != countnum)
     //if(stride != countnum)
     //if(shortpword != countnum)
+    //if(indirect.size != countnum)
+    //if(shortlayout + dsetcount != countnum)
         //if (stride != 40) //valheim
         //if (stride != 28 && stride != 56) //+44? deadlock
         //if (stride != 48) //zomby army 4 (set reversedDepth=true)
@@ -1672,8 +1699,8 @@ void VKAPI_CALL DetourVkCmdDrawIndexedIndirectCount(
     {
         static std::atomic<int> s_infoLogs{ 0 };
         if (s_infoLogs.fetch_add(1) < 20)
-        Log("3. stride == %d && dstride == %d && pstride == %d && shortkey == %d && attrcount == %d && pushword == %d",
-            stride, dstride, pstride, shortkey, attrcount, pushword);
+            Log("3. stride == %d && dstride == %d && pstride == %d && shortkey == %d && attrcount == %d && istride == %d && shortpword == %d && shortlayout == %d && indirect.size == %d && count.size == %d",
+                stride, dstride, pstride, shortkey, attrcount, istride, shortpword, shortlayout, indirect.size, count.size);
     }
 
     // ------------------------------------------------------------------
@@ -1801,6 +1828,38 @@ static bool HookFn(const char* name, PFN_vkVoidFunction fn, void* detour, void**
 //===================================================================================================//
 
 static PFN_vkDestroyPipeline pOriginalDestroyPipeline = nullptr;
+/*
+struct Graveyard { VkDevice dev; VkPipeline p; uint64_t frame; };
+static std::vector<Graveyard> g_dead;
+static std::atomic<uint64_t> g_frame{ 0 };
+
+void VKAPI_CALL DetourVkDestroyPipeline(
+    VkDevice device,
+    VkPipeline pipeline,
+    const VkAllocationCallbacks* pAllocator)
+{
+    if (pipeline != VK_NULL_HANDLE)
+    {
+        std::unique_lock<std::shared_mutex> lock(g_mtx);
+
+        auto it = g_pipeExtras.find(pipeline);
+        if (it != g_pipeExtras.end()) {
+            for (VkPipeline clone : it->second.hl) {
+                if (clone != VK_NULL_HANDLE)
+                    g_dead.push_back({ device, clone, g_frame.load() });
+            }
+            g_pipeExtras.erase(it);
+        }
+        g_libInfo.erase(pipeline);
+    }
+
+    Log("DestroyPipeline %p tracked=%d frame=%llu", pipeline,
+        (int)g_pipeExtras.count(pipeline), g_frame.load());
+
+    if (pOriginalDestroyPipeline)
+        pOriginalDestroyPipeline(device, pipeline, pAllocator);
+}
+*/
 
 void VKAPI_CALL DetourVkDestroyPipeline(
     VkDevice device,
@@ -1825,6 +1884,7 @@ void VKAPI_CALL DetourVkDestroyPipeline(
     if (pOriginalDestroyPipeline)
         pOriginalDestroyPipeline(device, pipeline, pAllocator);
 }
+
 
 /*
 //previous version
@@ -1887,11 +1947,11 @@ void ClearCmdState(VkCommandBuffer cmd)
     }
 
     std::unique_lock<std::shared_mutex> lock(g_mtx);
-    cmdIndexMap.erase(cmd);
     g_curPipeline.erase(cmd);
     g_curKey.erase(cmd);
     g_cmdBufStride.erase(cmd);
     g_cmdBufVertexInput.erase(cmd);
+    cmdDescMap.erase(cmd);
 }
 
 VkResult VKAPI_CALL DetourVkResetCommandBuffer(VkCommandBuffer commandBuffer,VkCommandBufferResetFlags flags)
@@ -2026,11 +2086,16 @@ static bool HookViaDummyDevice()
         { "vkCmdDrawIndexedIndirect",  (void*)DetourVkCmdDrawIndexedIndirect,  (void**)&pOriginalCmdDrawIndexedIndirect },
         { "vkCmdDrawIndexedIndirectCount",  (void*)DetourVkCmdDrawIndexedIndirectCount,  (void**)&pOriginalCmdDrawIndexedIndirectCount },
         { "vkCmdPushConstants",        (void*)DetourCmdPushConstants,          (void**)&pOriginalCmdPushConstants },
-        { "vkCmdBindIndexBuffer",      (void*)DetourVkCmdBindIndexBuffer,      (void**)&pOriginalCmdBindIndexBuffer },
+        { "vkCreateBuffer",            (void*)DetourVkCreateBuffer,            (void**)&pOriginalCreateBuffer },      
         { "vkDestroyPipeline",         (void*)DetourVkDestroyPipeline,         (void**)&pOriginalDestroyPipeline },
         { "vkResetCommandBuffer",      (void*)DetourVkResetCommandBuffer,      (void**)&pOriginalResetCommandBuffer },
         { "vkFreeCommandBuffers",      (void*)DetourVkFreeCommandBuffers,      (void**)&pOriginalFreeCommandBuffers },
+        { "vkCmdBindDescriptorSets",   (void*)DetourVkCmdBindDescriptorSets,   (void**)&pOriginalCmdBindDescriptorSets },
     };
+    //vkCmdSetVertexInputEXT
+    //vkCmdBindVertexBuffers2
+    //vkCmdBindVertexBuffers2EXT
+    //vkCmdBindVertexBuffers3KHR
 
     bool anyPatched = false;
 
