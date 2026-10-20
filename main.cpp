@@ -902,557 +902,6 @@ VKAPI_ATTR VkResult VKAPI_CALL DetourVkCreateGraphicsPipelines(
     return r;
 }
 
-/*
-VKAPI_ATTR VkResult VKAPI_CALL DetourVkCreateGraphicsPipelines(
-    VkDevice device,
-    VkPipelineCache cache,
-    uint32_t count,
-    const VkGraphicsPipelineCreateInfo* pCreateInfos,
-    const VkAllocationCallbacks* pAllocator,
-    VkPipeline* pPipelines)
-{
-    static std::atomic<bool> s_loggedOnce{ false };
-    if (!s_loggedOnce.exchange(true))
-        Log("DetourVkCreateGraphicsPipelines");
-
-    VkResult r = pOriginalCreateGraphicsPipelines(device, cache, count, pCreateInfos, pAllocator, pPipelines);
-    if (!pCreateInfos || !pPipelines || count == 0)
-        return r;
-
-    struct Entry
-    {
-        VkPipeline pipe = VK_NULL_HANDLE;
-        bool       isLibrary = false;
-        uint32_t   stride = 0;
-        uint32_t   strides[16] = {};
-        uint32_t   bindingMask = 0;
-        uint32_t   primaryBinding = kNoBinding;
-        uint32_t   attrCount = 0;
-        uint64_t   key = 0;
-        VkPipeline hl[HLM_COUNT] = {};
-        LibInfo    lib;
-    };
-
-    std::vector<Entry> entries;
-    entries.reserve(count);
-
-    for (uint32_t i = 0; i < count; ++i)
-    {
-        if (pPipelines[i] == VK_NULL_HANDLE)
-            continue;
-
-        const VkGraphicsPipelineCreateInfo& ci = pCreateInfos[i];
-        Entry e;
-        e.pipe = pPipelines[i];
-
-        const bool isLibrary = (ci.flags & VK_PIPELINE_CREATE_LIBRARY_BIT_KHR) != 0;
-        e.isLibrary = isLibrary;
-
-        // ------------------------------------------------------------
-        // Dynamic-state flags
-        // ------------------------------------------------------------
-        bool strideDyn = false, vinDyn = false, depthDyn = false, viewportDyn = false;
-        if (ci.pDynamicState && ci.pDynamicState->pDynamicStates)
-        {
-            for (uint32_t d = 0; d < ci.pDynamicState->dynamicStateCount; ++d)
-            {
-                const VkDynamicState s = ci.pDynamicState->pDynamicStates[d];
-                if (s == VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE) strideDyn = true;
-                if (s == VK_DYNAMIC_STATE_VERTEX_INPUT_EXT)            vinDyn = true;
-                if (s == VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE || s == VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE ||
-                    s == VK_DYNAMIC_STATE_DEPTH_COMPARE_OP || s == VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE ||
-                    s == VK_DYNAMIC_STATE_STENCIL_OP)
-                    depthDyn = true;
-                if (s == VK_DYNAMIC_STATE_VIEWPORT || s == VK_DYNAMIC_STATE_VIEWPORT_WITH_COUNT)
-                    viewportDyn = true;
-            }
-        }
-
-        // ------------------------------------------------------------
-        // pNext chain
-        // ------------------------------------------------------------
-        const VkGraphicsPipelineLibraryCreateInfoEXT* gpl = nullptr;
-        const VkPipelineLibraryCreateInfoKHR* li = nullptr;
-        for (auto p = static_cast<const VkBaseInStructure*>(ci.pNext); p; p = p->pNext)
-        {
-            if (p->sType == VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_LIBRARY_CREATE_INFO_EXT)
-                gpl = reinterpret_cast<const VkGraphicsPipelineLibraryCreateInfoEXT*>(p);
-            else if (p->sType == VK_STRUCTURE_TYPE_PIPELINE_LIBRARY_CREATE_INFO_KHR)
-                li = reinterpret_cast<const VkPipelineLibraryCreateInfoKHR*>(p);
-        }
-        const bool isLinked = li && li->libraryCount > 0 && li->pLibraries;
-
-        // ------------------------------------------------------------
-        // Linked libraries
-        // ------------------------------------------------------------
-        VkGraphicsPipelineLibraryFlagsEXT libParts = 0;
-        uint64_t libKey = 0;
-        uint32_t libStrides[16] = {};
-        uint32_t libBindingMask = 0;
-        uint32_t libPrimaryBinding = kNoBinding;
-        uint32_t libAttrCount = 0, libBindingCount = 0;
-        bool     libStrideUnknown = false;
-        bool     libHasFrag = false;
-        int      mTest = -1, mOp = -1, mWrite = -1, mStencil = -1;
-        bool     mDepthDyn = false;
-        bool     mViewportDyn = false;
-
-        std::vector<VkPipeline> modeLibs[HLM_COUNT];
-        VkGraphicsPipelineLibraryFlagsEXT modeParts[HLM_COUNT] = {};
-
-        if (isLinked)
-        {
-            std::vector<VkPipeline> origLibs(li->pLibraries, li->pLibraries + li->libraryCount);
-            for (int m = 0; m < HLM_COUNT; ++m)
-                modeLibs[m] = origLibs;
-
-            std::shared_lock<std::shared_mutex> lock(g_mtx); // read-only
-            for (size_t k = 0; k < origLibs.size(); ++k)
-            {
-                auto it = g_libInfo.find(origLibs[k]);
-                if (it == g_libInfo.end())
-                    continue;
-
-                const LibInfo& L = it->second;
-                libParts |= L.parts;
-                libKey = combine(libKey, L.key);
-                libHasFrag |= L.hasFrag;
-
-                if (L.parts & kGplFS)
-                {
-                    mTest = L.depthTest;  mOp = L.depthOp;
-                    mWrite = L.depthWrite; mStencil = L.stencilTest;
-                    mDepthDyn = L.depthDyn;
-                }
-                if (L.parts & kGplPre)
-                    mViewportDyn |= L.viewportDyn;
-                if (L.parts & kGplVI)
-                {
-                    memcpy(libStrides, L.strides, sizeof(libStrides));
-                    libBindingMask = L.bindingMask;
-                    libPrimaryBinding = L.primaryBinding;
-                    libStrideUnknown = L.strideUnknown;
-                    libAttrCount = L.attrCount;
-                    libBindingCount = L.bindingCount;
-                }
-
-                for (int m = 0; m < HLM_COUNT; ++m)
-                {
-                    if (L.twin[m] != VK_NULL_HANDLE && L.twinParts[m] != 0)
-                    {
-                        modeLibs[m][k] = L.twin[m];
-                        modeParts[m] |= L.twinParts[m];
-                    }
-                }
-            }
-        }
-
-        VkGraphicsPipelineLibraryFlagsEXT owned;
-        if (gpl)            owned = gpl->flags;
-        else if (isLinked)  owned = libParts ? (kGplAll & ~libParts) : 0;
-        else                owned = kGplAll;
-
-        const bool ownsVI = (owned & kGplVI) != 0;
-        const bool ownsPre = (owned & kGplPre) != 0;
-        const bool ownsFS = (owned & kGplFS) != 0;
-        const bool ownsFO = (owned & kGplFO) != 0;
-
-        // ------------------------------------------------------------
-        // Vertex input: per-binding strides + primary binding
-        // ------------------------------------------------------------
-        // vinDyn: pVertexInputState is ignored by the spec -> don't read it.
-        const VkPipelineVertexInputStateCreateInfo* vis =
-            (ownsVI && !vinDyn) ? ci.pVertexInputState : nullptr;
-
-        uint32_t ownStrides[16] = {};
-        uint32_t ownBindingMask = 0;
-        uint32_t ownPrimaryBinding = kNoBinding;
-        uint32_t ownAttrCount = 0;
-        uint32_t ownBindingCount = 0;
-
-        if (vis)
-        {
-            ownAttrCount = vis->vertexAttributeDescriptionCount;
-            ownBindingCount = vis->vertexBindingDescriptionCount;
-
-            if (vis->pVertexBindingDescriptions)
-            {
-                for (uint32_t bi = 0; bi < vis->vertexBindingDescriptionCount; ++bi)
-                {
-                    const auto& b = vis->pVertexBindingDescriptions[bi];
-                    if (b.binding < 16)
-                    {
-                        // strideDyn: static stride is ignored by the spec, may be junk -> store 0,
-                        // real value comes from vkCmdBindVertexBuffers2 at record time.
-                        ownStrides[b.binding] = strideDyn ? 0u : b.stride;
-                        ownBindingMask |= (1u << b.binding);
-                    }
-                }
-            }
-
-            // primary = binding used by the attribute at location 0 (usually position)
-            if (vis->pVertexAttributeDescriptions)
-            {
-                for (uint32_t a = 0; a < vis->vertexAttributeDescriptionCount; ++a)
-                {
-                    if (vis->pVertexAttributeDescriptions[a].location == 0)
-                    {
-                        ownPrimaryBinding = vis->pVertexAttributeDescriptions[a].binding;
-                        break;
-                    }
-                }
-            }
-        }
-
-        uint32_t strides[16] = {};
-        uint32_t bindingMask = 0;
-        uint32_t primaryBinding = kNoBinding;
-
-        if (ownsVI)
-        {
-            memcpy(strides, ownStrides, sizeof(strides));
-            bindingMask = ownBindingMask;
-            primaryBinding = ownPrimaryBinding;
-        }
-        else if (libParts & kGplVI)
-        {
-            memcpy(strides, libStrides, sizeof(strides));
-            bindingMask = libBindingMask;
-            primaryBinding = libPrimaryBinding;
-        }
-
-        const uint32_t attrCount = ownsVI ? ownAttrCount : libAttrCount;
-        const uint32_t bindingCount = ownsVI ? ownBindingCount : libBindingCount;
-        const bool strideUnknown = ownsVI ? (vinDyn || strideDyn) : libStrideUnknown;
-
-        // primary stride: location-0 binding if valid, else first non-zero stride, else 0
-        uint32_t primaryStride = 0;
-        if (bindingMask)
-        {
-            if (primaryBinding < 16 && (bindingMask & (1u << primaryBinding)))
-            {
-                primaryStride = strides[primaryBinding];
-            }
-            else
-            {
-                for (uint32_t b = 0; b < 16; ++b)
-                {
-                    if ((bindingMask & (1u << b)) && strides[b])
-                    {
-                        primaryStride = strides[b];
-                        primaryBinding = b;
-                        break;
-                    }
-                }
-                if (primaryStride == 0)
-                {
-                    unsigned long idx = 0;
-                    _BitScanForward(&idx, bindingMask); // bindingMask != 0 here
-                    primaryBinding = idx;
-                    primaryStride = strides[idx];
-                }
-            }
-        }
-
-        e.stride = primaryStride;
-        memcpy(e.strides, strides, sizeof(e.strides));
-        e.bindingMask = bindingMask;
-        e.primaryBinding = primaryBinding;
-        e.attrCount = attrCount;
-
-        // ------------------------------------------------------------
-        // Key
-        // ------------------------------------------------------------
-        uint64_t key = 0;
-        bool ownHasFrag = false;
-
-        if (ci.pStages && (ownsPre || ownsFS))
-        {
-            for (uint32_t s = 0; s < ci.stageCount; ++s)
-            {
-                const VkPipelineShaderStageCreateInfo& st = ci.pStages[s];
-
-                if (st.stage == VK_SHADER_STAGE_FRAGMENT_BIT)
-                    ownHasFrag = true;
-
-                uint64_t h = 0;
-                if (GetModuleHash(st.module, h))
-                    key = combine(key, h);
-                else
-                {
-                    key = combine(key, reinterpret_cast<uint64_t>(st.module));
-                    if (kVerboseKeyLog)
-                        Log("CreateGP: module %p not in g_moduleHash (using handle)", (void*)st.module);
-                }
-
-                key = combine(key, static_cast<uint64_t>(st.stage));
-
-                if (st.pName)
-                    for (const char* p = st.pName; *p; ++p)
-                        key = combine(key, static_cast<uint8_t>(*p));
-
-                if (st.pSpecializationInfo)
-                {
-                    const VkSpecializationInfo* si = st.pSpecializationInfo;
-                    if (si->pData && si->dataSize)
-                    {
-                        const uint8_t* d = static_cast<const uint8_t*>(si->pData);
-                        for (size_t b = 0; b < si->dataSize; ++b)
-                            key = combine(key, d[b]);
-                    }
-                    if (si->pMapEntries)
-                    {
-                        for (uint32_t m = 0; m < si->mapEntryCount; ++m)
-                        {
-                            key = combine(key, si->pMapEntries[m].constantID);
-                            key = combine(key, si->pMapEntries[m].offset);
-                            key = combine(key, si->pMapEntries[m].size);
-                        }
-                    }
-                }
-            }
-        }
-
-        if (vis)
-        {
-            if (vis->pVertexBindingDescriptions)
-            {
-                for (uint32_t b = 0; b < vis->vertexBindingDescriptionCount; ++b)
-                {
-                    key = combine(key, vis->pVertexBindingDescriptions[b].binding);
-                    // ignore junk static stride when it is dynamic, so equal pipelines hash equal
-                    key = combine(key, strideDyn ? 0u : vis->pVertexBindingDescriptions[b].stride);
-                    key = combine(key, vis->pVertexBindingDescriptions[b].inputRate);
-                }
-            }
-            if (vis->pVertexAttributeDescriptions)
-            {
-                for (uint32_t a = 0; a < vis->vertexAttributeDescriptionCount; ++a)
-                {
-                    key = combine(key, vis->pVertexAttributeDescriptions[a].location);
-                    key = combine(key, vis->pVertexAttributeDescriptions[a].binding);
-                    key = combine(key, vis->pVertexAttributeDescriptions[a].format);
-                    key = combine(key, vis->pVertexAttributeDescriptions[a].offset);
-                }
-            }
-        }
-
-        if (ownsVI && ci.pInputAssemblyState)
-        {
-            key = combine(key, ci.pInputAssemblyState->topology);
-            key = combine(key, ci.pInputAssemblyState->primitiveRestartEnable ? 1ull : 0ull);
-        }
-
-        if (ownsPre && ci.pRasterizationState)
-        {
-            key = combine(key, ci.pRasterizationState->polygonMode);
-            key = combine(key, ci.pRasterizationState->cullMode);
-            key = combine(key, ci.pRasterizationState->frontFace);
-            key = combine(key, ci.pRasterizationState->depthBiasEnable ? 1ull : 0ull);
-        }
-
-        if ((ownsFS || ownsFO) && ci.pMultisampleState)
-            key = combine(key, ci.pMultisampleState->rasterizationSamples);
-
-        if (ownsFS && ci.pDepthStencilState)
-        {
-            key = combine(key, ci.pDepthStencilState->depthTestEnable ? 1ull : 0ull);
-            key = combine(key, ci.pDepthStencilState->depthWriteEnable ? 1ull : 0ull);
-            key = combine(key, ci.pDepthStencilState->depthCompareOp);
-        }
-
-        if (ownsFO && ci.pColorBlendState && ci.pColorBlendState->pAttachments)
-        {
-            key = combine(key, ci.pColorBlendState->attachmentCount);
-            for (uint32_t a = 0; a < ci.pColorBlendState->attachmentCount; ++a)
-            {
-                const auto& att = ci.pColorBlendState->pAttachments[a];
-                key = combine(key, att.blendEnable ? 1ull : 0ull);
-                key = combine(key, att.colorWriteMask);
-            }
-        }
-
-        if (isLinked)
-            key = combine(key, libKey);
-        if (key == 0)
-            key = combine(key, 0xDEADBEEFCAFEBABEull);
-        e.key = key;
-
-        const bool hasFrag = ownHasFrag || libHasFrag;
-
-        int  dTest = mTest, dOp = mOp, dWrite = mWrite, dStencil = mStencil;
-        bool dDyn = mDepthDyn;
-        if (ownsFS && ci.pDepthStencilState)
-        {
-            dTest = ci.pDepthStencilState->depthTestEnable ? 1 : 0;
-            dOp = (int)ci.pDepthStencilState->depthCompareOp;
-            dWrite = ci.pDepthStencilState->depthWriteEnable ? 1 : 0;
-            dStencil = ci.pDepthStencilState->stencilTestEnable ? 1 : 0;
-            dDyn = depthDyn;
-        }
-        const bool vDyn = ownsPre ? viewportDyn : mViewportDyn;
-
-        const bool realDepthTest =
-            depthDyn ||
-            (ci.pDepthStencilState && ci.pDepthStencilState->depthTestEnable &&
-                ci.pDepthStencilState->depthCompareOp != VK_COMPARE_OP_ALWAYS &&
-                ci.pDepthStencilState->depthCompareOp != VK_COMPARE_OP_NEVER &&
-                ci.pDepthStencilState->depthCompareOp != VK_COMPARE_OP_NOT_EQUAL);
-        (void)realDepthTest;
-
-        // Wanted if: no vertex input at all, stride is in range, or stride is only known at record time.
-        // Add `&& primaryStride > 0` to the middle term if you want to EXCLUDE no-vertex-input pipelines.
-        const bool strideWanted = (bindingMask == 0) || (primaryStride <= 200) || strideUnknown;
-
-        // ------------------------------------------------------------
-        // Highlight twins
-        // ------------------------------------------------------------
-        auto logFail = [&](int m, VkResult hr)
-            {
-                static std::atomic<int> s_failLogs{ 0 };
-                if (s_failLogs.fetch_add(1) < 5)
-                    Log("Highlight create failed mode=%d hr=%d pipe=%p", m, (int)hr, (void*)e.pipe);
-            };
-
-        if (!isLinked && (isLibrary ? (ownsFS || ownsFO) : (hasFrag && strideWanted)))
-        {
-            VkShaderModule red = GetRedFragModule(device);
-            for (int m = 0; m < HLM_COUNT; ++m)
-            {
-                const uint32_t mode = kModeFlags[m];
-                HighlightStorage hs;
-                VkGraphicsPipelineCreateInfo hci = ci;
-                hci.flags &= ~(VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT |
-                    VK_PIPELINE_CREATE_DERIVATIVE_BIT);
-                hci.basePipelineHandle = VK_NULL_HANDLE;
-                hci.basePipelineIndex = -1;
-
-                const VkGraphicsPipelineLibraryFlagsEXT parts =
-                    BuildHighlightCI(ci, owned, (mode & HL_COLOR) ? red : VK_NULL_HANDLE,
-                        hs, hci, mode, vDyn);
-
-                bool complete;
-                if (isLibrary)             complete = parts != 0;
-                else if (mode & HL_COLOR)  complete = (parts & (kGplFS | kGplFO)) == (kGplFS | kGplFO);
-                else                       complete = (parts & kGplFS) != 0;
-                if (!complete)
-                    continue;
-
-                VkPipeline pipe = VK_NULL_HANDLE;
-                const VkResult hr = pOriginalCreateGraphicsPipelines(device, cache, 1, &hci, pAllocator, &pipe);
-                if (hr == VK_SUCCESS && pipe != VK_NULL_HANDLE)
-                {
-                    if (isLibrary) { e.lib.twin[m] = pipe; e.lib.twinParts[m] = parts; }
-                    else { e.hl[m] = pipe; }
-                }
-                else
-                {
-                    logFail(m, hr);
-                }
-            }
-        }
-        else if (isLinked && !ownsFS && !ownsFO && (isLibrary || (hasFrag && strideWanted)))
-        {
-            for (int m = 0; m < HLM_COUNT; ++m)
-            {
-                const VkGraphicsPipelineLibraryFlagsEXT parts = modeParts[m];
-
-                bool complete;
-                if (isLibrary)                         complete = parts != 0;
-                else if (kModeFlags[m] & HL_COLOR)     complete = (parts & (kGplFS | kGplFO)) == (kGplFS | kGplFO);
-                else                                   complete = (parts & kGplFS) != 0;
-                if (!complete)
-                    continue;
-
-                VkGraphicsPipelineCreateInfo hci = ci;
-                hci.flags &= ~(VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT |
-                    VK_PIPELINE_CREATE_DERIVATIVE_BIT);
-                hci.basePipelineHandle = VK_NULL_HANDLE;
-                hci.basePipelineIndex = -1;
-
-                // NOTE: this mutates the caller's memory temporarily (not thread-safe if the app
-                // reuses the same create-info from another thread). Safer: deep-copy `li` and
-                // re-chain it into a copy of the pNext list.
-                auto* mli = const_cast<VkPipelineLibraryCreateInfoKHR*>(li);
-                const VkPipeline* savedLibs = mli->pLibraries;
-                mli->pLibraries = modeLibs[m].data();
-
-                VkPipeline pipe = VK_NULL_HANDLE;
-                const VkResult hr = pOriginalCreateGraphicsPipelines(device, cache, 1, &hci, pAllocator, &pipe);
-
-                mli->pLibraries = savedLibs;
-
-                if (hr == VK_SUCCESS && pipe != VK_NULL_HANDLE)
-                {
-                    if (isLibrary) { e.lib.twin[m] = pipe; e.lib.twinParts[m] = parts; }
-                    else { e.hl[m] = pipe; }
-                }
-                else
-                {
-                    logFail(m, hr);
-                }
-            }
-        }
-
-        // Library bookkeeping (library-only fields)
-        if (isLibrary)
-        {
-            e.lib.stride = primaryStride;
-            memcpy(e.lib.strides, strides, sizeof(e.lib.strides));
-            e.lib.bindingMask = bindingMask;
-            e.lib.primaryBinding = primaryBinding;
-
-            e.lib.parts = isLinked ? (owned | libParts) : owned;
-            e.lib.strideUnknown = strideUnknown;
-            e.lib.attrCount = attrCount;
-            e.lib.bindingCount = bindingCount;
-            e.lib.hasFrag = hasFrag;
-            e.lib.key = key;
-            e.lib.depthTest = dTest;
-            e.lib.depthOp = dOp;
-            e.lib.depthWrite = dWrite;
-            e.lib.stencilTest = dStencil;
-            e.lib.depthDyn = dDyn;
-            e.lib.viewportDyn = vDyn;
-        }
-
-        entries.push_back(e);
-    }
-
-    // ------------------------------------------------------------
-    // ONE short lock, map writes only
-    // ------------------------------------------------------------
-    {
-        std::unique_lock<std::shared_mutex> lock(g_mtx);
-        for (const Entry& e : entries)
-        {
-            if (e.isLibrary)
-            {
-                g_libInfo[e.pipe] = e.lib;
-                g_pipeExtras.erase(e.pipe);
-            }
-            else
-            {
-                g_libInfo.erase(e.pipe);
-
-                PipeExtras pe;
-                pe.key = e.key;
-                pe.attrCount = e.attrCount;
-                pe.stride = e.stride;
-                memcpy(pe.strides, e.strides, sizeof(pe.strides));
-                pe.bindingMask = e.bindingMask;
-                pe.primaryBinding = e.primaryBinding;
-                for (int m = 0; m < HLM_COUNT; ++m)
-                    pe.hl[m] = e.hl[m];
-                g_pipeExtras[e.pipe] = pe;
-            }
-        }
-    }
-
-    return r;
-}
-*/
-
 //===================================================================================================//
 
 void VKAPI_CALL DetourVkCmdBindPipeline(VkCommandBuffer cmd, VkPipelineBindPoint bindPoint, VkPipeline pipeline)
@@ -1499,6 +948,19 @@ std::unordered_map<VkCommandBuffer, PushConstantState> cmdPushMap;
 void VKAPI_CALL DetourCmdPushConstants(VkCommandBuffer cb, VkPipelineLayout layout,
     VkShaderStageFlags stages, uint32_t offset, uint32_t size, const void* pValues)
 {
+    if (pValues && offset + size <= sizeof(PushConstantState::data)) {
+        std::unique_lock<std::shared_mutex> lock(g_mtx);  // must match draw-path readers
+        auto& s = cmdPushMap[cb];
+        std::memcpy(s.data + offset, pValues, size);
+        for (uint32_t o = offset; o < offset + size; o += 4)
+            s.dirtyMask |= 1u << (o / 4);
+    }
+    pOriginalCmdPushConstants(cb, layout, stages, offset, size, pValues);
+}
+/*
+void VKAPI_CALL DetourCmdPushConstants(VkCommandBuffer cb, VkPipelineLayout layout,
+    VkShaderStageFlags stages, uint32_t offset, uint32_t size, const void* pValues)
+{
     static bool loggedOnce = false;
     if (!loggedOnce) {
         Log("DetourCmdPushConstants");
@@ -1514,7 +976,7 @@ void VKAPI_CALL DetourCmdPushConstants(VkCommandBuffer cb, VkPipelineLayout layo
     }
     pOriginalCmdPushConstants(cb, layout, stages, offset, size, pValues);
 }
-
+*/
 //===================================================================================================//
 
 typedef VkResult(VKAPI_PTR* PFN_vkCreateBuffer)(VkDevice device, const VkBufferCreateInfo* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkBuffer* pBuffer);
@@ -1648,7 +1110,6 @@ void VKAPI_CALL DetourVkCmdSetVertexInputEXT(
         g_cmdBufVertexInput[cmd] = std::move(st);
     }
 
-    // Never call into the driver while holding g_mtx
     pOriginalCmdSetVertexInputEXT(cmd, bindingCount, pBindings, attrCount, pAttrs);
 }
 
@@ -2247,7 +1708,7 @@ void VKAPI_CALL DetourVkCmdDrawIndexedIndirectCount(
         //if (stride == 20 //world war z
         //if (shortkey == 10) //doom 2016
         //if (shortkey == 64) //wolfenstein 2: the new colossus
-        //if (shortkey == 30) //enshrouded
+        //if (shortkey == 30) //enshrouded incomplete
         //if (shortkey == 18) //doom the dark ages (heavy occlusion ruines wallhack)
     {
         if (logvaluesonce)
@@ -2501,7 +1962,6 @@ void ClearCmdState(VkCommandBuffer cmd)
     {
         std::unique_lock<std::shared_mutex> lock(statesMtx);
         cmdStates.erase(cmd);
-        cmdPushMap.erase(cmd);
     }
 
     std::unique_lock<std::shared_mutex> lock(g_mtx);
@@ -2510,6 +1970,7 @@ void ClearCmdState(VkCommandBuffer cmd)
     g_cmdBufStride.erase(cmd);
     g_cmdBufVertexInput.erase(cmd);
     cmdDescMap.erase(cmd);
+    cmdPushMap.erase(cmd);
 }
 
 VkResult VKAPI_CALL DetourVkResetCommandBuffer(VkCommandBuffer commandBuffer,VkCommandBufferResetFlags flags)
